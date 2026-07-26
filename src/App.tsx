@@ -1118,16 +1118,31 @@ export default function KehloDashboard() {
         {activeTab === 'positions' && (
           <div className="max-w-3xl space-y-4">
             {status.data?.live_mode_active ? (
-              <div className="p-3.5 rounded-lg flex items-center justify-between text-xs border shadow-sm"
-                style={{ background: `${C.short}12`, borderColor: `${C.short}44`, color: C.short }}>
-                <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full animate-ping" style={{ background: C.short }} />
-                  <span className="font-semibold uppercase tracking-wider">Bitget Live Account Active</span>
-                  <span className="hidden md:inline" style={{ color: C.paper }}>— Real money positions & USDT Futures balance</span>
+              <div className="space-y-2">
+                <div className="p-3.5 rounded-lg flex items-center justify-between text-xs border shadow-sm"
+                  style={{ background: `${C.short}12`, borderColor: `${C.short}44`, color: C.short }}>
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full animate-ping" style={{ background: C.short }} />
+                    <span className="font-semibold uppercase tracking-wider">Bitget Live Account Active</span>
+                    <span className="hidden md:inline" style={{ color: C.paper }}>— Real money positions & USDT Futures balance</span>
+                  </div>
+                  <span className="font-mono-data text-[10px] px-2 py-0.5 rounded font-bold" style={{ background: `${C.short}22` }}>
+                    REAL MONEY LIVE
+                  </span>
                 </div>
-                <span className="font-mono-data text-[10px] px-2 py-0.5 rounded font-bold" style={{ background: `${C.short}22` }}>
-                  REAL MONEY LIVE
-                </span>
+
+                {balanceQ.data?.error && (
+                  <div className="p-3.5 rounded-lg text-xs border flex flex-col gap-1 font-mono-data"
+                    style={{ background: `${C.short}18`, borderColor: C.short, color: C.paper }}>
+                    <div className="flex items-center justify-between font-bold" style={{ color: C.short }}>
+                      <span>⚠️ BITGET LIVE API KEY NEEDED</span>
+                      <button onClick={() => setActiveTab('connect')} className="underline hover:opacity-80">
+                        Go to Connect Tab →
+                      </button>
+                    </div>
+                    <div>{balanceQ.data.error}</div>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="p-3.5 rounded-lg flex items-center justify-between text-xs border"

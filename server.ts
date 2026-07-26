@@ -3,6 +3,12 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import {
+  BitgetCredentials,
+  fetchLiveBalance,
+  fetchLiveOpenPositions,
+  fetchLiveOrderHistory,
+} from './bitgetService';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -90,10 +96,16 @@ let quantSignals = [
   }
 ];
 
+let liveCredentials: BitgetCredentials | null = process.env.BITGET_LIVE_API_KEY ? {
+  apiKey: process.env.BITGET_LIVE_API_KEY,
+  apiSecret: process.env.BITGET_LIVE_API_SECRET || '',
+  passphrase: process.env.BITGET_LIVE_PASSPHRASE || '',
+} : null;
+
 let credentials = {
   live: { 
-    configured: !!process.env.BITGET_LIVE_API_KEY, 
-    updated_at: process.env.BITGET_LIVE_API_KEY ? new Date().toISOString() : null 
+    configured: !!(liveCredentials && liveCredentials.apiKey), 
+    updated_at: liveCredentials ? new Date().toISOString() : null 
   },
 };
 
@@ -380,30 +392,60 @@ app.post('/api/mode/set', (req: Request, res: Response) => {
   res.json({ requested: liveModeActive ? 'live' : 'demo' });
 });
 
-app.post('/api/credentials', (req: Request, res: Response) => {
+app.post('/api/credentials', async (req: Request, res: Response) => {
   const { mode, api_key, api_secret, passphrase } = req.body || {};
   if (mode !== 'live') {
     return res.status(400).json({ error: 'Dry Run mode does not require API keys. Live mode is the only option requiring API keys.' });
   }
   if (!api_key || !api_secret || !passphrase) {
-    return res.status(400).json({ error: 'api_key, api_secret, and passphrase are required for Live trading' });
+    return res.status(400).json({ error: 'API Key, API Secret, and Passphrase are required for Live trading' });
   }
 
+  const testCreds: BitgetCredentials = {
+    apiKey: api_key.trim(),
+    apiSecret: api_secret.trim(),
+    passphrase: passphrase.trim(),
+  };
+
+  // Test credentials against Bitget API immediately
+  const testBal = await fetchLiveBalance(testCreds);
+  if (testBal.error) {
+    addLog('error', 'bitget_live', `Bitget Credentials verification failed: ${testBal.error}`);
+    return res.status(400).json({ error: `Bitget Connection Failed: ${testBal.error}` });
+  }
+
+  liveCredentials = testCreds;
   credentials.live = { configured: true, updated_at: new Date().toISOString() };
 
   const mask = (s: string) => (s.length > 4 ? `***${s.slice(-4)}` : '****');
-  addLog('info', 'api', `Live Bitget API credentials attached via dashboard (key ending ${mask(api_key)})`);
-  res.json({ mode: 'live', saved: true, key_hint: mask(api_key) });
+  addLog('info', 'api', `Bitget Live Credentials verified & active! (Key ending ${mask(api_key)}, Account Equity: $${testBal.equity})`);
+  res.json({ mode: 'live', saved: true, key_hint: mask(api_key), equity: testBal.equity });
 });
 
 app.get('/api/credentials/status', (req: Request, res: Response) => {
   res.json({
     dry_run: { active: true, requires_keys: false },
-    live: credentials.live,
+    live: {
+      configured: !!(liveCredentials && liveCredentials.apiKey),
+      key_hint: liveCredentials?.apiKey ? (liveCredentials.apiKey.length > 4 ? `***${liveCredentials.apiKey.slice(-4)}` : '****') : null,
+      updated_at: credentials.live.updated_at,
+    },
   });
 });
 
-app.get('/api/trades/open', (req: Request, res: Response) => {
+app.get('/api/trades/open', async (req: Request, res: Response) => {
+  if (liveModeActive) {
+    if (!liveCredentials || !liveCredentials.apiKey) {
+      return res.json([]);
+    }
+    const livePos = await fetchLiveOpenPositions(liveCredentials);
+    if (livePos.error) {
+      addLog('error', 'bitget_live', livePos.error);
+      return res.json([]);
+    }
+    return res.json(livePos.positions);
+  }
+
   res.json(getActiveOpenTrades());
 });
 
@@ -437,7 +479,19 @@ app.post('/api/trades/:id/close', (req: Request, res: Response) => {
   res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice, mode: liveModeActive ? 'live' : 'dry_run' });
 });
 
-app.get('/api/trades/history', (req: Request, res: Response) => {
+app.get('/api/trades/history', async (req: Request, res: Response) => {
+  if (liveModeActive) {
+    if (!liveCredentials || !liveCredentials.apiKey) {
+      return res.json([]);
+    }
+    const liveHist = await fetchLiveOrderHistory(liveCredentials);
+    if (liveHist.error) {
+      addLog('error', 'bitget_live', liveHist.error);
+      return res.json([]);
+    }
+    return res.json(liveHist.history);
+  }
+
   res.json(getActiveTradeHistory());
 });
 
@@ -453,14 +507,34 @@ app.get('/api/logs', (req: Request, res: Response) => {
   res.json(logs);
 });
 
-app.get('/api/stats', (req: Request, res: Response) => {
+app.get('/api/stats', async (req: Request, res: Response) => {
+  if (liveModeActive) {
+    if (!liveCredentials || !liveCredentials.apiKey) {
+      return res.json({ mode: 'live', total_pnl: 0, win_rate_pct: 0, closed_trades: 0, winning_trades: 0, losing_trades: 0 });
+    }
+    const liveHist = await fetchLiveOrderHistory(liveCredentials);
+    const history = liveHist.history || [];
+    const totalPnl = history.reduce((acc: number, t: any) => acc + (t.realized_pnl || 0), 0);
+    const wins = history.filter((t: any) => (t.realized_pnl || 0) >= 0).length;
+    const winRate = history.length ? (wins / history.length) * 100 : 0;
+
+    return res.json({
+      mode: 'live',
+      total_pnl: Math.round(totalPnl * 100) / 100,
+      win_rate_pct: Math.round(winRate),
+      closed_trades: history.length,
+      winning_trades: wins,
+      losing_trades: history.length - wins,
+    });
+  }
+
   const history = getActiveTradeHistory();
   const totalPnl = history.reduce((acc, t) => acc + (t.realized_pnl || 0), 0);
   const wins = history.filter((t) => (t.realized_pnl || 0) >= 0).length;
   const winRate = history.length ? (wins / history.length) * 100 : 0;
 
   res.json({
-    mode: liveModeActive ? 'live' : 'dry_run',
+    mode: 'dry_run',
     total_pnl: Math.round(totalPnl * 100) / 100,
     win_rate_pct: Math.round(winRate),
     closed_trades: history.length,
@@ -475,7 +549,42 @@ app.post('/api/sync', (req: Request, res: Response) => {
   res.json({ synced: true, open_count: getActiveOpenTrades().length, mode: liveModeActive ? 'live' : 'dry_run' });
 });
 
-app.get('/api/account/balance', (req: Request, res: Response) => {
+app.get('/api/account/balance', async (req: Request, res: Response) => {
+  if (liveModeActive) {
+    if (!liveCredentials || !liveCredentials.apiKey) {
+      return res.json({
+        equity: 0,
+        base_capital: 0,
+        realized_pnl: 0,
+        unrealized_pnl: 0,
+        mode: 'live',
+        error: 'Bitget Live API keys are missing. Please go to the Connect tab and enter your Bitget API Key, Secret, and Passphrase.',
+      });
+    }
+
+    const liveBal = await fetchLiveBalance(liveCredentials);
+    if (liveBal.error) {
+      addLog('error', 'bitget_live', `Live Balance Fetch Failed: ${liveBal.error}`);
+      return res.json({
+        equity: 0,
+        base_capital: 0,
+        realized_pnl: 0,
+        unrealized_pnl: 0,
+        mode: 'live',
+        error: liveBal.error,
+      });
+    }
+
+    return res.json({
+      equity: liveBal.equity,
+      base_capital: liveBal.futures_equity,
+      realized_pnl: 0,
+      unrealized_pnl: liveBal.unrealized_pnl,
+      mode: 'live',
+      spot_equity: liveBal.spot_equity,
+    });
+  }
+
   const history = getActiveTradeHistory();
   const open = getActiveOpenTrades();
   const realizedPnl = history.reduce((acc, t) => acc + (t.realized_pnl || 0), 0);
@@ -488,7 +597,7 @@ app.get('/api/account/balance', (req: Request, res: Response) => {
     return acc + diff * size;
   }, 0);
 
-  const baseCapital = liveModeActive ? (quantSettings.total_capital || 5000.0) : 1000.0;
+  const baseCapital = 1000.0;
   const totalEquity = baseCapital + realizedPnl + unrealizedPnl;
 
   res.json({
@@ -496,7 +605,7 @@ app.get('/api/account/balance', (req: Request, res: Response) => {
     base_capital: baseCapital,
     realized_pnl: Math.round(realizedPnl * 100) / 100,
     unrealized_pnl: Math.round(unrealizedPnl * 100) / 100,
-    mode: liveModeActive ? 'live' : 'dry_run',
+    mode: 'dry_run',
   });
 });
 
