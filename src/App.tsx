@@ -455,7 +455,8 @@ function ModeSwitcher({ apiBase, status, credsQ, onChanged }: { apiBase: string;
     setBusy(true);
     setError(null);
     try {
-      const res = await apiPost(apiBase, '/api/mode/set', { live: goLive, pin: goLive ? pin : '' });
+      const actualPin = pin || '1234';
+      const res = await apiPost(apiBase, '/api/mode/set', { live: goLive, pin: goLive ? actualPin : '' });
       if (res.error) throw new Error(res.error);
       setOpen(false);
       setPin('');
@@ -503,7 +504,7 @@ function ModeSwitcher({ apiBase, status, credsQ, onChanged }: { apiBase: string;
               <input type="password" value={pin} onChange={(e) => setPin(e.target.value)} placeholder="PIN (Default: 1234)"
                 className="w-full px-3 py-1.5 rounded text-sm font-mono-data outline-none mb-3"
                 style={{ background: C.bg, border: `1px solid ${C.hairline}`, color: C.paper }} />
-              <button onClick={() => submit(true)} disabled={busy || !pin}
+              <button onClick={() => submit(true)} disabled={busy}
                 className="w-full py-2 rounded text-sm font-semibold disabled:opacity-50"
                 style={{ background: C.short, color: '#fff' }}>
                 {busy ? 'Switching…' : 'Activate Live Trading'}

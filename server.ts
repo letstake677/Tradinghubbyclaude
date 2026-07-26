@@ -91,7 +91,10 @@ let quantSignals = [
 ];
 
 let credentials = {
-  live: { configured: false, updated_at: null as string | null },
+  live: { 
+    configured: !!process.env.BITGET_LIVE_API_KEY, 
+    updated_at: process.env.BITGET_LIVE_API_KEY ? new Date().toISOString() : null 
+  },
 };
 
 let openTrades = [
