@@ -1,0 +1,6 @@
+{
+  "name": "Kehlo Trading Dashboard",
+  "description": "SMC Trading Bot Dashboard for monitoring positions, signals, logs, and Bitget settings",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
