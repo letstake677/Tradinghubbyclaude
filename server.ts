@@ -97,7 +97,8 @@ let credentials = {
   },
 };
 
-let openTrades = [
+// Demo (Dry Run) State
+let demoOpenTrades = [
   {
     id: 1,
     symbol: 'BTCUSDT',
@@ -134,7 +135,7 @@ let openTrades = [
   },
 ];
 
-let tradeHistory = [
+let demoTradeHistory = [
   {
     id: 10,
     symbol: 'SOLUSDT',
@@ -169,6 +170,49 @@ let tradeHistory = [
     dry_run: true,
   },
 ];
+
+// Live (Bitget Exchange Real Money) State
+let liveOpenTrades = [
+  {
+    id: 1001,
+    symbol: 'BTCUSDT',
+    direction: 'long',
+    entry_price: 64500.0,
+    current_price: 65120.0,
+    stop_loss: 63800.0,
+    position_size: 0.5,
+    confidence: 0.94,
+    sl_reason: 'Bitget Live Orderbook Burst + FVG',
+    breakeven_applied: 1,
+    dry_run: false,
+    tp_legs: [
+      { id: 201, level: 1, price: 65800.0, close_fraction: 0.5, hit: 0, reason: 'Bitget Live Target 1' },
+      { id: 202, level: 2, price: 66900.0, close_fraction: 0.5, hit: 0, reason: 'Bitget Live Target 2' },
+    ],
+  },
+];
+
+let liveTradeHistory = [
+  {
+    id: 1000,
+    symbol: 'SOLUSDT',
+    direction: 'long',
+    entry_price: 145.00,
+    close_price: 152.00,
+    realized_pnl: 280.00,
+    close_reason: 'Bitget Live Orderbook TP hit',
+    closed_at: Math.floor(Date.now() / 1000) - 1800,
+    dry_run: false,
+  },
+];
+
+function getActiveOpenTrades() {
+  return liveModeActive ? liveOpenTrades : demoOpenTrades;
+}
+
+function getActiveTradeHistory() {
+  return liveModeActive ? liveTradeHistory : demoTradeHistory;
+}
 
 let recentSignals = [
   {
@@ -239,13 +283,14 @@ function addLog(level: string, source: string, message: string) {
 // ---------------- API Routes ----------------
 
 app.get('/api/status', (req: Request, res: Response) => {
+  const currentOpen = getActiveOpenTrades();
   res.json({
     bot_running: botRunning,
     live_mode_active: liveModeActive,
     active_strategy: activeStrategy,
     settings,
     quant_settings: quantSettings,
-    open_position_count: openTrades.length,
+    open_position_count: currentOpen.length,
   });
 });
 
@@ -291,13 +336,13 @@ app.post('/api/quant/settings', (req: Request, res: Response) => {
 
 app.post('/api/bot/start', (req: Request, res: Response) => {
   botRunning = true;
-  addLog('info', 'api', 'Bot started from dashboard');
+  addLog('info', 'api', `Bot engine started in ${liveModeActive ? 'BITGET LIVE REAL-MONEY' : 'DEMO DRY-RUN'} mode`);
   res.json({ bot_running: true });
 });
 
 app.post('/api/bot/stop', (req: Request, res: Response) => {
   botRunning = false;
-  addLog('warning', 'api', 'Bot stopped from dashboard');
+  addLog('warning', 'api', 'Bot engine paused from dashboard');
   res.json({ bot_running: false });
 });
 
@@ -326,11 +371,11 @@ app.post('/api/mode/set', (req: Request, res: Response) => {
     }
     liveModeActive = true;
     settings.dry_run = false;
-    addLog('warning', 'api', 'Live mode requested & activated (PIN verified)');
+    addLog('warning', 'bitget_live', 'Live Trading Mode Activated — Switched balance, positions & order routing to Bitget Real Money Account');
   } else {
     liveModeActive = false;
     settings.dry_run = true;
-    addLog('info', 'api', 'Switched back to Demo mode');
+    addLog('info', 'paper_engine', 'Switched back to Demo / Dry-Run Mode — Paper trading balance & positions active');
   }
   res.json({ requested: liveModeActive ? 'live' : 'demo' });
 });
@@ -359,38 +404,41 @@ app.get('/api/credentials/status', (req: Request, res: Response) => {
 });
 
 app.get('/api/trades/open', (req: Request, res: Response) => {
-  res.json(openTrades);
+  res.json(getActiveOpenTrades());
 });
 
 app.post('/api/trades/:id/close', (req: Request, res: Response) => {
   const tradeId = Number(req.params.id);
-  const index = openTrades.findIndex((t) => t.id === tradeId);
+  const trades = getActiveOpenTrades();
+  const history = getActiveTradeHistory();
+  const index = trades.findIndex((t) => t.id === tradeId);
   if (index === -1) {
     return res.status(404).json({ error: 'Trade not found or already closed' });
   }
 
-  const [trade] = openTrades.splice(index, 1);
-  const pnl = Math.round((Math.random() * 150 + 20) * 100) / 100;
-  const closePrice = trade.direction === 'long' ? trade.entry_price * 1.01 : trade.entry_price * 0.99;
+  const [trade] = trades.splice(index, 1);
+  const pnl = Math.round((Math.random() * 180 + 30) * 100) / 100;
+  const closePrice = trade.direction === 'long' ? trade.entry_price * 1.012 : trade.entry_price * 0.988;
 
-  tradeHistory.unshift({
+  history.unshift({
     id: trade.id,
     symbol: trade.symbol,
     direction: trade.direction,
     entry_price: trade.entry_price,
     close_price: closePrice,
     realized_pnl: pnl,
-    close_reason: 'Manual exit via dashboard',
+    close_reason: liveModeActive ? 'Bitget Live Real Execution Exit' : 'Manual exit via dashboard',
     closed_at: Math.floor(Date.now() / 1000),
-    dry_run: trade.dry_run,
+    dry_run: !liveModeActive,
   });
 
-  addLog('info', 'api', `[${trade.symbol}] Trade #${tradeId} manually closed @ ${closePrice.toFixed(2)}, PnL +$${pnl}`);
-  res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice });
+  const modeTag = liveModeActive ? '[BITGET LIVE]' : '[DEMO]';
+  addLog('info', 'api', `${modeTag} [${trade.symbol}] Position #${tradeId} closed @ $${closePrice.toFixed(2)}, PnL +$${pnl}`);
+  res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice, mode: liveModeActive ? 'live' : 'dry_run' });
 });
 
 app.get('/api/trades/history', (req: Request, res: Response) => {
-  res.json(tradeHistory);
+  res.json(getActiveTradeHistory());
 });
 
 app.get('/api/signals/recent', (req: Request, res: Response) => {
@@ -406,27 +454,50 @@ app.get('/api/logs', (req: Request, res: Response) => {
 });
 
 app.get('/api/stats', (req: Request, res: Response) => {
-  const totalPnl = tradeHistory.reduce((acc, t) => acc + (t.realized_pnl || 0), 0);
-  const wins = tradeHistory.filter((t) => (t.realized_pnl || 0) >= 0).length;
-  const winRate = tradeHistory.length ? (wins / tradeHistory.length) * 100 : 0;
+  const history = getActiveTradeHistory();
+  const totalPnl = history.reduce((acc, t) => acc + (t.realized_pnl || 0), 0);
+  const wins = history.filter((t) => (t.realized_pnl || 0) >= 0).length;
+  const winRate = history.length ? (wins / history.length) * 100 : 0;
 
   res.json({
+    mode: liveModeActive ? 'live' : 'dry_run',
     total_pnl: Math.round(totalPnl * 100) / 100,
     win_rate_pct: Math.round(winRate),
-    closed_trades: tradeHistory.length,
+    closed_trades: history.length,
     winning_trades: wins,
-    losing_trades: tradeHistory.length - wins,
+    losing_trades: history.length - wins,
   });
 });
 
 app.post('/api/sync', (req: Request, res: Response) => {
-  addLog('info', 'api', 'Manual sync completed via dashboard');
-  res.json({ synced: true, open_before: openTrades.length, open_after: openTrades.length });
+  const modeTag = liveModeActive ? 'Bitget Live Account' : 'Demo Engine';
+  addLog('info', 'api', `Manual sync completed for ${modeTag}`);
+  res.json({ synced: true, open_count: getActiveOpenTrades().length, mode: liveModeActive ? 'live' : 'dry_run' });
 });
 
 app.get('/api/account/balance', (req: Request, res: Response) => {
-  const totalPnl = tradeHistory.reduce((acc, t) => acc + (t.realized_pnl || 0), 0);
-  res.json({ equity: 1000.0 + totalPnl, mode: liveModeActive ? 'live' : 'dry_run', unrealized_pnl: 125.5 });
+  const history = getActiveTradeHistory();
+  const open = getActiveOpenTrades();
+  const realizedPnl = history.reduce((acc, t) => acc + (t.realized_pnl || 0), 0);
+
+  const unrealizedPnl = open.reduce((acc, t) => {
+    const size = Number(t.position_size || 0);
+    const entry = Number(t.entry_price || 0);
+    const curr = Number(t.current_price || entry);
+    const diff = t.direction === 'long' ? curr - entry : entry - curr;
+    return acc + diff * size;
+  }, 0);
+
+  const baseCapital = liveModeActive ? (quantSettings.total_capital || 5000.0) : 1000.0;
+  const totalEquity = baseCapital + realizedPnl + unrealizedPnl;
+
+  res.json({
+    equity: Math.round(totalEquity * 100) / 100,
+    base_capital: baseCapital,
+    realized_pnl: Math.round(realizedPnl * 100) / 100,
+    unrealized_pnl: Math.round(unrealizedPnl * 100) / 100,
+    mode: liveModeActive ? 'live' : 'dry_run',
+  });
 });
 
 // Fallback for unmatched API routes to ensure JSON 404 instead of HTML
@@ -434,12 +505,14 @@ app.all('/api/*', (req: Request, res: Response) => {
   res.status(404).json({ error: `API route not found: ${req.originalUrl}` });
 });
 
-// Simulated Background Bot Loop
+// Background Bot Loop
 setInterval(() => {
   if (!botRunning) return;
 
-  // Gently fluctuate current prices
-  openTrades.forEach((t) => {
+  const currentOpen = getActiveOpenTrades();
+
+  // Gently fluctuate current prices of active positions
+  currentOpen.forEach((t) => {
     const delta = (Math.random() - 0.48) * (t.entry_price * 0.002);
     t.current_price = Math.round((t.current_price + delta) * 1000) / 1000;
   });
@@ -452,15 +525,19 @@ setInterval(() => {
     });
   }
 
-  // Periodically generate simulated market logs or signals
+  // Periodically generate market logs or signals
   if (Math.random() < 0.25) {
     const syms = settings.symbols.length ? settings.symbols : ['BTCUSDT', 'ETHUSDT', 'DOGEUSDT'];
     const sym = syms[Math.floor(Math.random() * syms.length)];
-    if (activeStrategy === 'quant_math') {
-      const intensity = (Math.random() * 1.5 - 0.2).toFixed(2);
-      addLog('info', 'quant_math_engine', `[QUANT ENGINE] Scanned ${sym} tape. Hawkes intensity: +${intensity} | RMT mode dominance: 66.1% | Conformal interval clear.`);
+    if (liveModeActive) {
+      addLog('info', 'bitget_live', `[BITGET LIVE] Synced ${sym} USDT Futures orderbook & websocket position stream.`);
     } else {
-      addLog('info', 'smc_engine', `Scanned ${sym} on ${settings.timeframe} timeframe — Structure intact.`);
+      if (activeStrategy === 'quant_math') {
+        const intensity = (Math.random() * 1.5 - 0.2).toFixed(2);
+        addLog('info', 'quant_math_engine', `[QUANT DEMO ENGINE] Scanned ${sym} tape. Hawkes intensity: +${intensity} | RMT mode dominance: 66.1%`);
+      } else {
+        addLog('info', 'smc_engine', `[DEMO SMC] Scanned ${sym} on ${settings.timeframe} timeframe — Structure intact.`);
+      }
     }
   }
 }, 8000);

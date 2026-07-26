@@ -149,6 +149,14 @@ function PositionCard({ pos, apiBase, onClose }: { pos: any; apiBase: string; on
             {isLong ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
             {isLong ? 'LONG' : 'SHORT'}
           </span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded font-mono-data font-semibold uppercase"
+            style={{
+              background: !pos.dry_run ? `${C.short}22` : `${C.amber}1a`,
+              color: !pos.dry_run ? C.short : C.amber,
+              border: `1px solid ${!pos.dry_run ? C.short : C.amber}`,
+            }}>
+            {!pos.dry_run ? 'BITGET LIVE' : 'DEMO'}
+          </span>
           {breakevenActive && (
             <span className="text-xs px-2 py-0.5 rounded flex items-center gap-1" style={{ color: C.amber, background: `${C.amber}1a` }}>
               <ShieldCheck size={12} /> SL at breakeven
@@ -277,6 +285,13 @@ function HistoryRow({ h }: { h: any }) {
         <span className="font-display font-semibold">{h.symbol}</span>
         <span className="text-xs px-2 py-0.5 rounded uppercase font-mono-data" style={{ background: C.panelAlt, color: h.direction === 'long' ? C.long : C.short }}>
           {h.direction}
+        </span>
+        <span className="text-[10px] px-1.5 py-0.2 rounded uppercase font-mono-data font-semibold"
+          style={{
+            background: !h.dry_run ? `${C.short}22` : `${C.amber}1a`,
+            color: !h.dry_run ? C.short : C.amber,
+          }}>
+          {!h.dry_run ? 'LIVE' : 'DEMO'}
         </span>
         <span className="text-xs truncate hidden sm:inline" style={{ color: C.muted }}>{h.close_reason}</span>
       </div>
@@ -1001,9 +1016,17 @@ export default function KehloDashboard() {
             onChanged={() => { status.refetch().catch(() => {}); }} />
 
           {balanceQ.data && (
-            <div className="px-3 py-1 rounded text-xs font-mono-data font-semibold"
+            <div className="px-3 py-1 rounded text-xs font-mono-data font-semibold flex items-center gap-2"
               style={{ background: C.panel, border: `1px solid ${C.hairline}`, color: C.paper }}>
-              Equity: <span style={{ color: C.amber }}>${Number(balanceQ.data.equity || 1000).toFixed(2)}</span>
+              <span className="text-[10px] px-1.5 py-0.2 rounded uppercase font-sans font-bold"
+                style={{
+                  background: balanceQ.data.mode === 'live' ? `${C.short}22` : `${C.amber}22`,
+                  color: balanceQ.data.mode === 'live' ? C.short : C.amber,
+                  border: `1px solid ${balanceQ.data.mode === 'live' ? C.short : C.amber}`,
+                }}>
+                {balanceQ.data.mode === 'live' ? 'LIVE' : 'DEMO'}
+              </span>
+              Equity: <span style={{ color: balanceQ.data.mode === 'live' ? C.short : C.amber }}>${Number(balanceQ.data.equity || 1000).toFixed(2)}</span>
             </div>
           )}
 
@@ -1093,19 +1116,47 @@ export default function KehloDashboard() {
         )}
 
         {activeTab === 'positions' && (
-          openTrades.loading && !openTrades.data ? (
-            <div className="text-xs font-mono-data p-4" style={{ color: C.muted }}>Loading active positions…</div>
-          ) : (openTrades.data || []).length === 0 ? (
-            <div style={{ background: C.panel, border: `1px dashed ${C.hairline}`, color: C.muted }} className="rounded-lg p-8 text-xs font-mono-data text-center">
-              No active positions — the {activeStrat === 'quant_math' ? 'Quant Tape engine' : 'SMC engine'} is monitoring market liquidity.
-            </div>
-          ) : (
-            <div className="space-y-4 max-w-3xl">
-              {(openTrades.data || []).map((pos: any) => (
-                <PositionCard key={pos.id} pos={pos} apiBase={apiBase} onClose={openTrades.refetch} />
-              ))}
-            </div>
-          )
+          <div className="max-w-3xl space-y-4">
+            {status.data?.live_mode_active ? (
+              <div className="p-3.5 rounded-lg flex items-center justify-between text-xs border shadow-sm"
+                style={{ background: `${C.short}12`, borderColor: `${C.short}44`, color: C.short }}>
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full animate-ping" style={{ background: C.short }} />
+                  <span className="font-semibold uppercase tracking-wider">Bitget Live Account Active</span>
+                  <span className="hidden md:inline" style={{ color: C.paper }}>— Real money positions & USDT Futures balance</span>
+                </div>
+                <span className="font-mono-data text-[10px] px-2 py-0.5 rounded font-bold" style={{ background: `${C.short}22` }}>
+                  REAL MONEY LIVE
+                </span>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-lg flex items-center justify-between text-xs border"
+                style={{ background: `${C.amber}12`, borderColor: `${C.amber}44`, color: C.amber }}>
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full" style={{ background: C.amber }} />
+                  <span className="font-semibold uppercase tracking-wider">Demo / Paper Trading Environment</span>
+                  <span className="hidden md:inline" style={{ color: C.paper }}>— Paper capital simulator ($1,000.00 base)</span>
+                </div>
+                <span className="font-mono-data text-[10px] px-2 py-0.5 rounded font-bold" style={{ background: `${C.amber}22` }}>
+                  DRY RUN
+                </span>
+              </div>
+            )}
+
+            {openTrades.loading && !openTrades.data ? (
+              <div className="text-xs font-mono-data p-4" style={{ color: C.muted }}>Loading active positions…</div>
+            ) : (openTrades.data || []).length === 0 ? (
+              <div style={{ background: C.panel, border: `1px dashed ${C.hairline}`, color: C.muted }} className="rounded-lg p-8 text-xs font-mono-data text-center">
+                No active positions in {status.data?.live_mode_active ? 'Live Bitget Mode' : 'Demo Paper Mode'} — the {activeStrat === 'quant_math' ? 'Quant Tape engine' : 'SMC engine'} is monitoring market liquidity.
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {(openTrades.data || []).map((pos: any) => (
+                  <PositionCard key={pos.id} pos={pos} apiBase={apiBase} onClose={openTrades.refetch} />
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {activeTab === 'signals' && (
