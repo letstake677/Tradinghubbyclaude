@@ -151,8 +151,42 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
 
 export async function fetchLiveOrderHistory(creds: BitgetCredentials) {
   try {
+    // 1. Try fetching real closed positions history from Bitget Futures V2 API
+    const posRes = await bitgetApiRequest(
+      '/api/v2/mix/position/history-position?productType=USDT-FUTURES&pageSize=50',
+      'GET',
+      null,
+      creds
+    );
+
+    if (posRes.code === '00000') {
+      const posList = posRes.data?.list || posRes.data || [];
+      if (Array.isArray(posList) && posList.length > 0) {
+        const formatted = posList.map((p: any) => {
+          const pnl = parseFloat(p.netProfit || p.pnl || p.achievedProfits || '0');
+          const openPrice = parseFloat(p.openAvgPrice || p.openPrice || '0');
+          const closePrice = parseFloat(p.closeAvgPrice || p.closePrice || openPrice || '0');
+          const holdSide = (p.holdSide || 'long').toLowerCase();
+          return {
+            id: p.positionId || p.symbol + '_' + (p.cTime || p.uTime || Math.random()),
+            symbol: p.symbol,
+            direction: holdSide === 'short' ? 'short' : 'long',
+            entry_price: openPrice,
+            close_price: closePrice,
+            realized_pnl: pnl,
+            close_reason: `Bitget Realized Trade [Net: $${pnl.toFixed(2)}]`,
+            closed_at: Math.floor(parseInt(p.uTime || p.cTime || Date.now(), 10) / 1000),
+            dry_run: false,
+          };
+        });
+
+        return { success: true, history: formatted };
+      }
+    }
+
+    // 2. Fallback to order history if history-position has no items, filtering STRICTLY for filled/executed orders
     const res = await bitgetApiRequest(
-      '/api/v2/mix/order/orders-history?productType=USDT-FUTURES&pageSize=20',
+      '/api/v2/mix/order/orders-history?productType=USDT-FUTURES&pageSize=50',
       'GET',
       null,
       creds
@@ -166,19 +200,32 @@ export async function fetchLiveOrderHistory(creds: BitgetCredentials) {
     }
 
     const rawList = res.data?.entrustedList || res.data || [];
-    const formatted = Array.isArray(rawList)
-      ? rawList.map((o: any) => ({
-          id: o.orderId || o.clientOid || Math.random(),
-          symbol: o.symbol,
-          direction: (o.side || 'buy').toLowerCase().includes('sell') ? 'short' : 'long',
-          entry_price: parseFloat(o.priceAvg || o.price || '0'),
-          close_price: parseFloat(o.priceAvg || o.price || '0'),
-          realized_pnl: parseFloat(o.pnl || '0'),
-          close_reason: `Bitget Live Order [Status: ${o.status || 'closed'}]`,
-          closed_at: Math.floor(parseInt(o.uTime || o.cTime || Date.now(), 10) / 1000),
-          dry_run: false,
-        }))
-      : [];
+    if (!Array.isArray(rawList)) {
+      return { success: true, history: [] };
+    }
+
+    // Strictly filter out canceled, untriggered, or un-filled orders
+    const filledOrders = rawList.filter((o: any) => {
+      const st = (o.status || o.state || '').toLowerCase();
+      if (st.includes('cancel') || st === 'live' || st === 'init' || st === 'new') {
+        return false;
+      }
+      const filledQty = parseFloat(o.filledQty || o.baseVolume || o.tradeQty || '0');
+      const pnl = parseFloat(o.pnl || '0');
+      return st === 'filled' || st === 'completed' || st === 'partially_filled' || filledQty > 0 || pnl !== 0;
+    });
+
+    const formatted = filledOrders.map((o: any) => ({
+      id: o.orderId || o.clientOid || Math.random(),
+      symbol: o.symbol,
+      direction: (o.side || 'buy').toLowerCase().includes('sell') ? 'short' : 'long',
+      entry_price: parseFloat(o.priceAvg || o.price || '0'),
+      close_price: parseFloat(o.priceAvg || o.price || '0'),
+      realized_pnl: parseFloat(o.pnl || '0'),
+      close_reason: `Bitget Executed Order [Status: ${o.status || 'filled'}]`,
+      closed_at: Math.floor(parseInt(o.uTime || o.cTime || Date.now(), 10) / 1000),
+      dry_run: false,
+    }));
 
     return { success: true, history: formatted };
   } catch (err: any) {

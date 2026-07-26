@@ -515,7 +515,7 @@ app.get('/api/stats', async (req: Request, res: Response) => {
     const liveHist = await fetchLiveOrderHistory(liveCredentials);
     const history = liveHist.history || [];
     const totalPnl = history.reduce((acc: number, t: any) => acc + (t.realized_pnl || 0), 0);
-    const wins = history.filter((t: any) => (t.realized_pnl || 0) >= 0).length;
+    const wins = history.filter((t: any) => (t.realized_pnl || 0) > 0).length;
     const winRate = history.length ? (wins / history.length) * 100 : 0;
 
     return res.json({
