@@ -1108,7 +1108,7 @@ export default function KehloDashboard() {
         )}
 
         {activeTab === 'signals' && (
-          <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg max-w-3xl divide-y" style={{ borderColor: C.hairline }}>
+          <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg max-w-3xl divide-y">
             {signalsQ.loading && !signalsQ.data ? (
               <div className="p-4 text-xs font-mono-data" style={{ color: C.muted }}>Loading market signals…</div>
             ) : (signalsQ.data || []).length === 0 ? (
@@ -1120,7 +1120,7 @@ export default function KehloDashboard() {
         )}
 
         {activeTab === 'history' && (
-          <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg max-w-3xl divide-y" style={{ borderColor: C.hairline }}>
+          <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg max-w-3xl divide-y">
             {history.loading && !history.data ? (
               <div className="p-4 text-xs font-mono-data" style={{ color: C.muted }}>Loading trade history…</div>
             ) : (history.data || []).length === 0 ? (
@@ -1142,7 +1142,7 @@ export default function KehloDashboard() {
                 </button>
               ))}
             </div>
-            <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg divide-y" style={{ borderColor: C.hairline }}>
+            <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg divide-y">
               {logsQ.loading && !logsQ.data ? (
                 <div className="p-6 text-xs font-mono-data text-center" style={{ color: C.muted }}>Loading execution logs…</div>
               ) : (logsQ.data || []).length === 0 ? (
