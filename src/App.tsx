@@ -199,9 +199,9 @@ function PositionCard({ pos, apiBase, onClose }: { pos: any; apiBase: string; on
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 p-2.5 rounded font-mono-data text-xs" style={{ background: C.bg }}>
         <div><span className="block text-[10px]" style={{ color: C.muted }}>Size</span>{pos.position_size} units</div>
-        <div><span className="block text-[10px]" style={{ color: C.muted }}>Entry Price</span>${entryPrice.toFixed(2)}</div>
-        <div><span className="block text-[10px]" style={{ color: C.muted }}>Current Price</span>${currentPrice.toFixed(2)}</div>
-        <div><span className="block text-[10px]" style={{ color: C.muted }}>Stop Loss</span><span style={{ color: C.short }}>${Number(pos.stop_loss).toFixed(2)}</span></div>
+        <div><span className="block text-[10px]" style={{ color: C.muted }}>Entry Price</span>${entryPrice > 1 ? entryPrice.toFixed(2) : entryPrice.toFixed(5)}</div>
+        <div><span className="block text-[10px]" style={{ color: C.muted }}>Current Price</span>${currentPrice > 1 ? currentPrice.toFixed(2) : currentPrice.toFixed(5)}</div>
+        <div><span className="block text-[10px]" style={{ color: C.muted }}>Stop Loss</span><span style={{ color: C.short }}>${Number(pos.stop_loss) > 1 ? Number(pos.stop_loss).toFixed(2) : Number(pos.stop_loss).toFixed(5)}</span></div>
       </div>
 
       {pos.sl_reason && (
@@ -227,7 +227,7 @@ function PositionCard({ pos, apiBase, onClose }: { pos: any; apiBase: string; on
         ) : (
           legs.map((tp: any) => {
             const tpPrice = Number(tp.price || 0);
-            const formattedPrice = tpPrice > 1000 ? tpPrice.toFixed(2) : tpPrice > 1 ? tpPrice.toFixed(2) : tpPrice.toFixed(4);
+            const formattedPrice = tpPrice > 1000 ? tpPrice.toFixed(2) : tpPrice > 1 ? tpPrice.toFixed(2) : tpPrice.toFixed(5);
             return (
               <div key={tp.id} className="flex items-center justify-between text-xs gap-2 flex-wrap py-0.5">
                 <div className="flex items-center" style={{ color: tp.hit === 1 ? C.long : C.paper }}>

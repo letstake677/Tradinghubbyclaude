@@ -118,7 +118,7 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
     }
 
     // Try fetching pending TP/SL plan orders from Bitget to match exact trigger prices
-    const planOrdersMap: Record<string, { tpPrice?: number; slPrice?: number }> = {};
+    const planOrdersMap: Record<string, { tpPrices: number[]; slPrices: number[] }> = {};
     try {
       const planRes = await bitgetApiRequest(
         '/api/v2/mix/order/orders-plan-pending?productType=USDT-FUTURES',
@@ -132,13 +132,17 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
           list.forEach((o: any) => {
             const sym = o.symbol;
             if (!sym) return;
-            if (!planOrdersMap[sym]) planOrdersMap[sym] = {};
+            if (!planOrdersMap[sym]) {
+              planOrdersMap[sym] = { tpPrices: [], slPrices: [] };
+            }
             const trigger = parseFloat(o.triggerPrice || o.executePrice || o.price || '0');
-            const planType = (o.planType || o.orderType || '').toLowerCase();
-            if (planType.includes('profit') || planType.includes('tp') || planType.includes('take')) {
-              planOrdersMap[sym].tpPrice = trigger;
-            } else if (planType.includes('loss') || planType.includes('sl') || planType.includes('stop')) {
-              planOrdersMap[sym].slPrice = trigger;
+            if (trigger > 0) {
+              const planType = (o.planType || o.orderType || '').toLowerCase();
+              if (planType.includes('profit') || planType.includes('tp') || planType.includes('take')) {
+                planOrdersMap[sym].tpPrices.push(trigger);
+              } else if (planType.includes('loss') || planType.includes('sl') || planType.includes('stop')) {
+                planOrdersMap[sym].slPrices.push(trigger);
+              }
             }
           });
         }
@@ -159,30 +163,67 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
         const holdSide = (p.holdSide || p.posSide || 'long').toLowerCase();
         const isShort = holdSide === 'short';
 
+        const symbolPlan = planOrdersMap[sym] || { tpPrices: [], slPrices: [] };
+        const sortedTPs = [...symbolPlan.tpPrices].sort((a, b) => isShort ? b - a : a - b);
+        const sortedSLs = [...symbolPlan.slPrices].sort((a, b) => isShort ? a - b : b - a);
+
         const presetSL = parseFloat(
-          p.presetStopLossPrice || p.stopLoss || p.slPrice || planOrdersMap[sym]?.slPrice || '0'
+          p.presetStopLossPrice || p.stopLoss || p.slPrice || (sortedSLs[0] || 0)
         );
         const presetTP = parseFloat(
-          p.presetTakeProfitPrice || p.presetStopProfitPrice || p.takeProfit || p.tpPrice || planOrdersMap[sym]?.tpPrice || '0'
+          p.presetTakeProfitPrice || p.presetStopProfitPrice || p.takeProfit || (sortedTPs[0] || 0)
         );
 
         const liqPrice = parseFloat(p.liquidationPrice || p.breakEvenPrice || '0');
         const stopLossVal = presetSL > 0 ? presetSL : 0;
 
-        const decimals = entry > 1000 ? 2 : entry > 1 ? 2 : 4;
+        const tickDecimals: Record<string, number> = {
+          BTC: 1,
+          ETH: 2,
+          SOL: 2,
+          BNB: 2,
+          AVAX: 2,
+          LINK: 3,
+          XRP: 4,
+          ADA: 4,
+          SUI: 4,
+          DOT: 2,
+          NEAR: 3,
+          APT: 3,
+          DOGE: 5,
+          PEPE: 8,
+          SHIB: 8,
+          FLOKI: 8,
+          BONK: 8,
+        };
+        const decimals = tickDecimals[sym.toUpperCase().replace('USDT', '')] !== undefined 
+          ? tickDecimals[sym.toUpperCase().replace('USDT', '')] 
+          : (entry > 1000 ? 1 : entry > 1 ? 2 : 4);
 
         let tp1Val = 0;
         let tp2Val = 0;
         let tp3Val = 0;
 
-        if (presetTP > 0) {
-          tp1Val = presetTP;
+        if (sortedTPs.length >= 3) {
+          tp1Val = sortedTPs[0];
+          tp2Val = sortedTPs[1];
+          tp3Val = sortedTPs[2];
+        } else if (sortedTPs.length === 2) {
+          tp1Val = sortedTPs[0];
+          tp2Val = sortedTPs[1];
           if (isShort) {
-            tp2Val = Number((presetTP * 0.988).toFixed(decimals));
-            tp3Val = Number((presetTP * 0.975).toFixed(decimals));
+            tp3Val = Number((tp2Val * 0.985).toFixed(decimals));
           } else {
-            tp2Val = Number((presetTP * 1.012).toFixed(decimals));
-            tp3Val = Number((presetTP * 1.025).toFixed(decimals));
+            tp3Val = Number((tp2Val * 1.015).toFixed(decimals));
+          }
+        } else if (sortedTPs.length === 1) {
+          tp1Val = sortedTPs[0];
+          if (isShort) {
+            tp2Val = Number((tp1Val * 0.988).toFixed(decimals));
+            tp3Val = Number((tp1Val * 0.975).toFixed(decimals));
+          } else {
+            tp2Val = Number((tp1Val * 1.012).toFixed(decimals));
+            tp3Val = Number((tp1Val * 1.025).toFixed(decimals));
           }
         } else {
           if (isShort) {
@@ -213,7 +254,7 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
             price: tp1Val,
             close_fraction: 0.4,
             hit: tp1Hit ? 1 : 0,
-            reason: presetTP > 0
+            reason: sortedTPs.length >= 1
               ? `Bitget Exchange Target 1 ($${tp1Val})`
               : `50% Structural Target ($${tp1Val})`,
           },
@@ -223,7 +264,9 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
             price: tp2Val,
             close_fraction: 0.3,
             hit: tp2Hit ? 1 : 0,
-            reason: `Order Block Target ($${tp2Val})`,
+            reason: sortedTPs.length >= 2
+              ? `Bitget Exchange Target 2 ($${tp2Val})`
+              : `Order Block Target ($${tp2Val})`,
           },
           {
             id: `${sym}_tp3_${idx}`,
@@ -231,7 +274,9 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
             price: tp3Val,
             close_fraction: 0.3,
             hit: tp3Hit ? 1 : 0,
-            reason: `Liquidity Expansion Target ($${tp3Val})`,
+            reason: sortedTPs.length >= 3
+              ? `Bitget Exchange Target 3 ($${tp3Val})`
+              : `Liquidity Expansion Target ($${tp3Val})`,
           },
         ];
 
