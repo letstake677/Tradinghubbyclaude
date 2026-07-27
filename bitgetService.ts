@@ -167,7 +167,7 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
         );
 
         const liqPrice = parseFloat(p.liquidationPrice || p.breakEvenPrice || '0');
-        const stopLossVal = presetSL > 0 ? presetSL : liqPrice;
+        const stopLossVal = presetSL > 0 ? presetSL : 0;
 
         const decimals = entry > 1000 ? 2 : entry > 1 ? 2 : 4;
 
@@ -515,7 +515,7 @@ export async function placeLiveOrder(
     const side = params.direction === 'long' ? 'buy' : 'sell';
     const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
 
-    const buildPayload = (tSide?: string) => {
+    const buildPayload = (tSide?: string, includeTPSL = true) => {
       const payload: Record<string, any> = {
         productType: 'USDT-FUTURES',
         symbol: params.symbol,
@@ -529,17 +529,43 @@ export async function placeLiveOrder(
       if (tSide) {
         payload.tradeSide = tSide;
       }
+
+      if (includeTPSL) {
+        if (params.presetStopLossPrice) {
+          const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
+          if (!isNaN(numSL) && numSL > 0) {
+            payload.presetStopLossPrice = formatPriceForBitget(params.symbol, numSL);
+          }
+        }
+        if (params.presetTakeProfitPrice) {
+          const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
+          if (!isNaN(numTP) && numTP > 0) {
+            payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
+          }
+        }
+      }
       return payload;
     };
 
-    // Attempt 1: Hedge Mode ('open')
-    let payload = buildPayload('open');
+    // Attempt 1: Hedge Mode ('open') + TP/SL
+    let payload = buildPayload('open', true);
     let res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
 
-    // Attempt 2: One-Way Mode (omit tradeSide) if attempt 1 returned mode/side mismatch error
+    // Attempt 2: One-Way Mode (omit tradeSide) + TP/SL if attempt 1 returned mode/side mismatch error
     if (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side mismatch') || res.msg.toLowerCase().includes('unilateral')))) {
-      payload = buildPayload(undefined);
+      payload = buildPayload(undefined, true);
       res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+    }
+
+    // Attempt 3: If tick size / price precision error (e.g. 45115), retry without preset TP/SL as fallback
+    if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
+      payload = buildPayload('open', false);
+      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+
+      if (res.code !== '00000') {
+        payload = buildPayload(undefined, false);
+        res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+      }
     }
 
     if (res.code !== '00000') {
