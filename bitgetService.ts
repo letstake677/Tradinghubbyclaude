@@ -515,7 +515,7 @@ export async function placeLiveOrder(
     const side = params.direction === 'long' ? 'buy' : 'sell';
     const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
 
-    const buildPayload = (tSide?: string, includeTPSL = true) => {
+    const buildPayload = (tSide?: string) => {
       const payload: Record<string, any> = {
         productType: 'USDT-FUTURES',
         symbol: params.symbol,
@@ -529,52 +529,17 @@ export async function placeLiveOrder(
       if (tSide) {
         payload.tradeSide = tSide;
       }
-
-      if (includeTPSL) {
-        if (params.presetStopLossPrice) {
-          const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
-          if (!isNaN(numSL) && numSL > 0) {
-            payload.presetStopLossPrice = formatPriceForBitget(params.symbol, numSL);
-          }
-        }
-        if (params.presetTakeProfitPrice) {
-          const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
-          if (!isNaN(numTP) && numTP > 0) {
-            const formattedTP = formatPriceForBitget(params.symbol, numTP);
-            payload.presetTakeProfitPrice = formattedTP;
-            payload.presetStopProfitPrice = formattedTP; // Bitget V2 API standard parameter name
-          }
-        }
-      }
       return payload;
     };
 
-    // Attempt 1: Hedge Mode ('open') + TP/SL (Most common for Bitget Futures)
-    let payload = buildPayload('open', true);
+    // Attempt 1: Hedge Mode ('open')
+    let payload = buildPayload('open');
     let res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
 
-    if (res.code === '00000') {
-      return { success: true, data: res.data };
-    }
-
-    // Attempt 2: One-Way Mode (omit tradeSide) + TP/SL if attempt 1 returned mode/side mismatch error
+    // Attempt 2: One-Way Mode (omit tradeSide) if attempt 1 returned mode/side mismatch error
     if (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side mismatch') || res.msg.toLowerCase().includes('unilateral')))) {
-      payload = buildPayload(undefined, true);
+      payload = buildPayload(undefined);
       res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-      if (res.code === '00000') {
-        return { success: true, data: res.data };
-      }
-    }
-
-    // Attempt 3: If tick size / price precision error (e.g. 45115), retry without preset TP/SL as fallback
-    if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
-      payload = buildPayload('open', false);
-      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-
-      if (res.code !== '00000') {
-        payload = buildPayload(undefined, false);
-        res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-      }
     }
 
     if (res.code !== '00000') {
@@ -583,31 +548,36 @@ export async function placeLiveOrder(
       };
     }
 
+    let tpError = null;
+    let slError = null;
+    
     // Attach explicit TP and SL plan orders to guarantee Bitget shows TP 1 / SL 1 on position
     if (params.presetTakeProfitPrice) {
       const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
       if (!isNaN(numTP) && numTP > 0) {
-        await placeLiveTPSL(creds, {
+        const tpRes = await placeLiveTPSL(creds, {
           symbol: params.symbol,
           holdSide: params.direction,
           planType: 'profit_plan',
           triggerPrice: numTP,
         });
+        if (tpRes.error) tpError = tpRes.error;
       }
     }
     if (params.presetStopLossPrice) {
       const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
       if (!isNaN(numSL) && numSL > 0) {
-        await placeLiveTPSL(creds, {
+        const slRes = await placeLiveTPSL(creds, {
           symbol: params.symbol,
           holdSide: params.direction,
           planType: 'loss_plan',
           triggerPrice: numSL,
         });
+        if (slRes.error) slError = slRes.error;
       }
     }
 
-    return { success: true, data: res.data };
+    return { success: true, data: res.data, tpError, slError };
   } catch (err: any) {
     return { error: `Network/Bitget Order Error: ${err.message || String(err)}` };
   }
@@ -638,6 +608,11 @@ export async function placeLiveTPSL(
       },
       creds
     );
+    if (res.code !== '00000') {
+      const errMsg = `[BITGET TPSL ERROR] ${params.symbol} ${params.planType} at ${formattedPrice}: ${res.msg}`;
+      console.error(errMsg);
+      return { error: errMsg, code: res.code, msg: res.msg };
+    }
     return res;
   } catch (err: any) {
     return { error: String(err) };
@@ -651,7 +626,7 @@ export async function cancelLivePlanOrders(
 ) {
   try {
     const res = await bitgetApiRequest(
-      '/api/v2/mix/order/cancel-plan-order',
+      '/api/v2/mix/order/cancel-all-plan-order',
       'POST',
       {
         productType: 'USDT-FUTURES',

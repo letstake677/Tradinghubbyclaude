@@ -715,7 +715,17 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
       return res.status(400).json({ error: orderRes.error });
     }
 
-    addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
+    let logSuffix = '';
+    if (orderRes.tpError) {
+      addLog('warning', 'bitget_live_execution', `[TP SET FAILED] ${sym}: ${orderRes.tpError}`);
+      logSuffix += ' (TP FAILED)';
+    }
+    if (orderRes.slError) {
+      addLog('warning', 'bitget_live_execution', `[SL SET FAILED] ${sym}: ${orderRes.slError}`);
+      logSuffix += ' (SL FAILED)';
+    }
+
+    addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})${logSuffix}`);
     
     // Refresh live open positions immediately
     const updatedPos = await fetchLiveOpenPositions(liveCredentials);
@@ -1039,7 +1049,16 @@ async function scanCoinsAndGenerateSignals() {
                 if (orderRes.error) {
                   addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${orderRes.error}`);
                 } else {
-                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
+                  let logSuffix = '';
+                  if (orderRes.tpError) {
+                    addLog('warning', 'bitget_live_auto', `[TP SET FAILED] ${sym}: ${orderRes.tpError}`);
+                    logSuffix += ' (TP FAILED)';
+                  }
+                  if (orderRes.slError) {
+                    addLog('warning', 'bitget_live_auto', `[SL SET FAILED] ${sym}: ${orderRes.slError}`);
+                    logSuffix += ' (SL FAILED)';
+                  }
+                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})${logSuffix}`);
                   autoTradesExecuted++;
                 }
               } catch (e: any) {
