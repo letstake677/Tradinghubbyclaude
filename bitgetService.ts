@@ -117,38 +117,66 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
       };
     }
 
-    // Try fetching pending TP/SL plan orders from Bitget to match exact trigger prices
+    // Fetch pending TP/SL plan orders from Bitget using all relevant planType filters
     const planOrdersMap: Record<string, { tpPrices: number[]; slPrices: number[] }> = {};
     try {
-      const planRes = await bitgetApiRequest(
-        '/api/v2/mix/order/orders-plan-pending?productType=USDT-FUTURES',
-        'GET',
-        null,
-        creds
+      const planTypes = ['profit_plan', 'loss_plan', 'pos_profit', 'pos_loss', 'normal_plan', 'moving_plan'];
+      const planPromises = planTypes.map((pt) =>
+        bitgetApiRequest(
+          `/api/v2/mix/order/orders-plan-pending?productType=USDT-FUTURES&planType=${pt}`,
+          'GET',
+          null,
+          creds
+        )
       );
-      if (planRes.code === '00000') {
-        const list = planRes.data?.entrustedList || planRes.data?.list || (Array.isArray(planRes.data) ? planRes.data : []);
-        if (Array.isArray(list)) {
-          list.forEach((o: any) => {
-            const sym = o.symbol;
-            if (!sym) return;
-            if (!planOrdersMap[sym]) {
-              planOrdersMap[sym] = { tpPrices: [], slPrices: [] };
-            }
-            const trigger = parseFloat(o.triggerPrice || o.executePrice || o.price || '0');
-            if (trigger > 0) {
-              const planType = (o.planType || o.orderType || '').toLowerCase();
-              if (planType.includes('profit') || planType.includes('tp') || planType.includes('take')) {
-                planOrdersMap[sym].tpPrices.push(trigger);
-              } else if (planType.includes('loss') || planType.includes('sl') || planType.includes('stop')) {
-                planOrdersMap[sym].slPrices.push(trigger);
+      planPromises.push(
+        bitgetApiRequest(
+          '/api/v2/mix/order/orders-plan-pending?productType=USDT-FUTURES',
+          'GET',
+          null,
+          creds
+        )
+      );
+
+      const planResults = await Promise.all(planPromises);
+      for (const planRes of planResults) {
+        if (planRes && planRes.code === '00000') {
+          const list = planRes.data?.entrustedList || planRes.data?.list || (Array.isArray(planRes.data) ? planRes.data : []);
+          if (Array.isArray(list)) {
+            list.forEach((o: any) => {
+              const rawSym = o.symbol || '';
+              if (!rawSym) return;
+              const cleanSym = rawSym.replace(/[\/\-\_\s]/g, '').toUpperCase().replace('UMCBL', '');
+              if (!planOrdersMap[cleanSym]) {
+                planOrdersMap[cleanSym] = { tpPrices: [], slPrices: [] };
               }
-            }
-          });
+              const trigger = parseFloat(o.triggerPrice || o.executePrice || o.price || o.trigger_price || '0');
+              if (trigger > 0) {
+                const planType = (o.planType || o.orderType || o.type || '').toLowerCase();
+                const isTP = planType.includes('profit') || planType.includes('tp') || planType.includes('take');
+                const isSL = planType.includes('loss') || planType.includes('sl') || planType.includes('stop');
+
+                if (isTP) {
+                  if (!planOrdersMap[cleanSym].tpPrices.includes(trigger)) {
+                    planOrdersMap[cleanSym].tpPrices.push(trigger);
+                  }
+                } else if (isSL) {
+                  if (!planOrdersMap[cleanSym].slPrices.includes(trigger)) {
+                    planOrdersMap[cleanSym].slPrices.push(trigger);
+                  }
+                } else {
+                  // If type is not explicitly named profit or loss, check if trigger > entry or store in tpPrices/slPrices
+                  if (!planOrdersMap[cleanSym].tpPrices.includes(trigger) && !planOrdersMap[cleanSym].slPrices.includes(trigger)) {
+                    planOrdersMap[cleanSym].tpPrices.push(trigger);
+                  }
+                }
+              }
+            });
+          }
         }
       }
     } catch (e) {
-      // Non-blocking fallback
+      console.error('Error fetching plan orders from Bitget:', e);
     }
 
     const rawList = Array.isArray(res.data)
@@ -157,22 +185,30 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
     const formatted = rawList
       .filter((p: any) => parseFloat(p.total || p.holdAmount || p.available || p.position || '0') > 0)
       .map((p: any, idx: number) => {
-        const sym = p.symbol;
+        const sym = p.symbol || '';
+        const cleanSym = sym.replace(/[\/\-\_\s]/g, '').toUpperCase().replace('UMCBL', '');
         const entry = parseFloat(p.openPriceAvg || p.averageOpenPrice || p.openPrice || '0');
         const curr = parseFloat(p.marketPrice || p.markPrice || p.lastPrice || entry || '0');
         const holdSide = (p.holdSide || p.posSide || 'long').toLowerCase();
         const isShort = holdSide === 'short';
 
-        const symbolPlan = planOrdersMap[sym] || { tpPrices: [], slPrices: [] };
-        const sortedTPs = [...symbolPlan.tpPrices].sort((a, b) => isShort ? b - a : a - b);
-        const sortedSLs = [...symbolPlan.slPrices].sort((a, b) => isShort ? a - b : b - a);
+        const symbolPlan = planOrdersMap[cleanSym] || { tpPrices: [], slPrices: [] };
 
-        const presetSL = parseFloat(
-          p.presetStopLossPrice || p.stopLoss || p.slPrice || (sortedSLs[0] || 0)
-        );
-        const presetTP = parseFloat(
-          p.presetTakeProfitPrice || p.presetStopProfitPrice || p.takeProfit || (sortedTPs[0] || 0)
-        );
+        // Collect direct TP/SL attached to position if present
+        const directTP = parseFloat(p.presetTakeProfitPrice || p.presetStopProfitPrice || p.takeProfit || p.tpPrice || '0');
+        const directSL = parseFloat(p.presetStopLossPrice || p.stopLoss || p.slPrice || '0');
+
+        const allTPs = [...symbolPlan.tpPrices];
+        if (directTP > 0 && !allTPs.includes(directTP)) allTPs.push(directTP);
+
+        const allSLs = [...symbolPlan.slPrices];
+        if (directSL > 0 && !allSLs.includes(directSL)) allSLs.push(directSL);
+
+        const sortedTPs = allTPs.sort((a, b) => isShort ? b - a : a - b);
+        const sortedSLs = allSLs.sort((a, b) => isShort ? a - b : b - a);
+
+        const presetSL = directSL > 0 ? directSL : (sortedSLs[0] || 0);
+        const presetTP = directTP > 0 ? directTP : (sortedTPs[0] || 0);
 
         const liqPrice = parseFloat(p.liquidationPrice || p.breakEvenPrice || '0');
         const stopLossVal = presetSL > 0 ? presetSL : 0;
@@ -759,21 +795,23 @@ export async function placeLiveTPSL(
       }
     }
 
-    const res = await bitgetApiRequest(
-      '/api/v2/mix/order/place-tpsl-order',
-      'POST',
-      {
-        productType: 'USDT-FUTURES',
-        symbol: params.symbol,
-        marginCoin: 'USDT',
-        planType: params.planType,
-        triggerPrice: formattedPrice,
-        triggerType: 'mark_price',
-        holdSide: params.holdSide,
-        size: sizeToUse,
-      },
-      creds
-    );
+    const payload: Record<string, any> = {
+      productType: 'USDT-FUTURES',
+      symbol: params.symbol,
+      marginCoin: 'USDT',
+      planType: params.planType,
+      triggerPrice: formattedPrice,
+      triggerType: 'mark_price',
+      holdSide: params.holdSide,
+      size: sizeToUse,
+    };
+
+    let res = await bitgetApiRequest('/api/v2/mix/order/place-tpsl-order', 'POST', payload, creds);
+    if (res.code !== '00000' && (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side') || res.msg.toLowerCase().includes('unilateral'))))) {
+      delete payload.holdSide;
+      res = await bitgetApiRequest('/api/v2/mix/order/place-tpsl-order', 'POST', payload, creds);
+    }
+
     if (res.code !== '00000') {
       const errMsg = `[BITGET TPSL ERROR] ${params.symbol} ${params.planType} at ${formattedPrice}: ${res.msg}`;
       console.error(errMsg);
