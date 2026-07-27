@@ -123,12 +123,13 @@ let demoOpenTrades = [
     stop_loss: 63500.0,
     position_size: 0.25,
     confidence: 0.88,
-    sl_reason: 'Liquidity sweep at 63480 + Bullish FVG',
+    sl_reason: 'Liquidity sweep at $63480 + Bullish FVG',
     breakeven_applied: 1,
     dry_run: true,
     tp_legs: [
-      { id: 101, level: 1, price: 65000.0, close_fraction: 0.5, hit: 0, reason: '1.5R target' },
-      { id: 102, level: 2, price: 66200.0, close_fraction: 0.5, hit: 0, reason: 'HTF resistance' },
+      { id: 101, level: 1, price: 65100.0, close_fraction: 0.4, hit: 0, reason: '50% Equilibrium & FVG Fill' },
+      { id: 102, level: 2, price: 65850.0, close_fraction: 0.3, hit: 0, reason: 'Bearish Order Block Supply' },
+      { id: 103, level: 3, price: 66400.0, close_fraction: 0.3, hit: 0, reason: 'External BSL High Expansion' },
     ],
   },
   {
@@ -140,12 +141,13 @@ let demoOpenTrades = [
     stop_loss: 3530.0,
     position_size: 2.5,
     confidence: 0.82,
-    sl_reason: 'Orderblock rejection at 3525',
+    sl_reason: 'Orderblock rejection at $3525',
     breakeven_applied: 0,
     dry_run: true,
     tp_legs: [
-      { id: 103, level: 1, price: 3410.0, close_fraction: 0.5, hit: 1, reason: 'FVG fill' },
-      { id: 104, level: 2, price: 3320.0, close_fraction: 0.5, hit: 0, reason: 'Sell side liquidity' },
+      { id: 104, level: 1, price: 3410.0, close_fraction: 0.4, hit: 1, reason: '50% Equilibrium & FVG Fill' },
+      { id: 105, level: 2, price: 3350.0, close_fraction: 0.3, hit: 0, reason: 'Bullish Order Block Demand' },
+      { id: 106, level: 3, price: 3290.0, close_fraction: 0.3, hit: 0, reason: 'External SSL Low Expansion' },
     ],
   },
 ];
@@ -505,6 +507,146 @@ app.post('/api/trades/:id/close', async (req: Request, res: Response) => {
   res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice, mode: 'dry_run' });
 });
 
+function computeStructuralTPSL(
+  direction: 'long' | 'short',
+  currentPrice: number,
+  high24?: number,
+  low24?: number
+) {
+  const isBullish = direction === 'long';
+  const decimals = currentPrice > 10 ? 2 : (currentPrice > 0.1 ? 4 : 6);
+
+  const h24 = (high24 && high24 > 0) ? high24 : (isBullish ? currentPrice * 1.03 : currentPrice * 1.015);
+  const l24 = (low24 && low24 > 0) ? low24 : (isBullish ? currentPrice * 0.985 : currentPrice * 0.97);
+  const equilibrium = (h24 + l24) / 2;
+
+  let stopLoss: number;
+  let tp1Price: number;
+  let tp2Price: number;
+  let tp3Price: number;
+
+  if (isBullish) {
+    // Stop Loss: Below Sell-Side Liquidity (SSL) Low
+    const sslLow = (l24 < currentPrice) ? l24 : currentPrice * 0.988;
+    stopLoss = sslLow * 0.997; // 0.3% buffer under SSL pool
+
+    if (currentPrice - stopLoss < currentPrice * 0.005) {
+      stopLoss = currentPrice * 0.988;
+    }
+
+    // TP1: 50% Equilibrium & Internal FVG Fill
+    if (currentPrice < equilibrium) {
+      tp1Price = equilibrium;
+    } else {
+      tp1Price = currentPrice + (h24 - currentPrice) * 0.45;
+    }
+    if (tp1Price <= currentPrice) tp1Price = currentPrice * 1.012;
+
+    // TP2: Bearish Order Block Supply Zone
+    tp2Price = currentPrice + (h24 - currentPrice) * 0.85;
+    if (tp2Price <= tp1Price) tp2Price = tp1Price * 1.015;
+
+    // TP3: External Buy-Side Liquidity (BSL) Expansion Target
+    tp3Price = Math.max(h24 * 1.008, tp2Price * 1.015);
+
+    const slVal = Number(stopLoss.toFixed(decimals));
+    const tp1Val = Number(tp1Price.toFixed(decimals));
+    const tp2Val = Number(tp2Price.toFixed(decimals));
+    const tp3Val = Number(tp3Price.toFixed(decimals));
+
+    return {
+      stop_loss: slVal,
+      sl_reason: `Structural SSL Low Invalidation ($${slVal})`,
+      tp_legs: [
+        {
+          id: Date.now() + 1,
+          level: 1,
+          price: tp1Val,
+          close_fraction: 0.4,
+          hit: 0,
+          reason: `50% Equilibrium & FVG Fill ($${tp1Val})`,
+        },
+        {
+          id: Date.now() + 2,
+          level: 2,
+          price: tp2Val,
+          close_fraction: 0.3,
+          hit: 0,
+          reason: `Bearish Order Block Supply ($${tp2Val})`,
+        },
+        {
+          id: Date.now() + 3,
+          level: 3,
+          price: tp3Val,
+          close_fraction: 0.3,
+          hit: 0,
+          reason: `External BSL High Expansion ($${tp3Val})`,
+        },
+      ],
+    };
+  } else {
+    // Bearish Short
+    // Stop Loss: Above Buy-Side Liquidity (BSL) High
+    const bslHigh = (h24 > currentPrice) ? h24 : currentPrice * 1.012;
+    stopLoss = bslHigh * 1.003; // 0.3% buffer above BSL pool
+
+    if (stopLoss - currentPrice < currentPrice * 0.005) {
+      stopLoss = currentPrice * 1.012;
+    }
+
+    // TP1: 50% Equilibrium & Internal FVG Fill
+    if (currentPrice > equilibrium) {
+      tp1Price = equilibrium;
+    } else {
+      tp1Price = currentPrice - (currentPrice - l24) * 0.45;
+    }
+    if (tp1Price >= currentPrice) tp1Price = currentPrice * 0.988;
+
+    // TP2: Bullish Order Block Demand Zone
+    tp2Price = currentPrice - (currentPrice - l24) * 0.85;
+    if (tp2Price >= tp1Price) tp2Price = tp1Price * 0.985;
+
+    // TP3: External Sell-Side Liquidity (SSL) Expansion Target
+    tp3Price = Math.min(l24 * 0.992, tp2Price * 0.985);
+
+    const slVal = Number(stopLoss.toFixed(decimals));
+    const tp1Val = Number(tp1Price.toFixed(decimals));
+    const tp2Val = Number(tp2Price.toFixed(decimals));
+    const tp3Val = Number(tp3Price.toFixed(decimals));
+
+    return {
+      stop_loss: slVal,
+      sl_reason: `Structural BSL High Invalidation ($${slVal})`,
+      tp_legs: [
+        {
+          id: Date.now() + 1,
+          level: 1,
+          price: tp1Val,
+          close_fraction: 0.4,
+          hit: 0,
+          reason: `50% Equilibrium & FVG Fill ($${tp1Val})`,
+        },
+        {
+          id: Date.now() + 2,
+          level: 2,
+          price: tp2Val,
+          close_fraction: 0.3,
+          hit: 0,
+          reason: `Bullish Order Block Demand ($${tp2Val})`,
+        },
+        {
+          id: Date.now() + 3,
+          level: 3,
+          price: tp3Val,
+          close_fraction: 0.3,
+          hit: 0,
+          reason: `External SSL Low Expansion ($${tp3Val})`,
+        },
+      ],
+    };
+  }
+}
+
 app.post('/api/trades/execute', async (req: Request, res: Response) => {
   const { symbol, direction, price, signal_id } = req.body || {};
   if (!symbol || !direction) {
@@ -516,10 +658,16 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
   const execPrice = parseFloat(price || '0');
 
   // Mark signal as taken if signal_id provided
-  if (signal_id) {
-    const sig = recentSignals.find((s) => s.id === signal_id || String(s.id) === String(signal_id));
-    if (sig) sig.taken = 1;
-  }
+  let sig = signal_id ? recentSignals.find((s) => s.id === signal_id || String(s.id) === String(signal_id)) : null;
+  if (sig) sig.taken = 1;
+
+  const entryP = execPrice > 0 ? execPrice : (sig?.price || 100);
+  const high24 = sig?.high24 || 0;
+  const low24 = sig?.low24 || 0;
+
+  const structTPSL = (sig && sig.stop_loss && sig.tp_legs)
+    ? { stop_loss: sig.stop_loss, sl_reason: sig.sl_reason, tp_legs: sig.tp_legs }
+    : computeStructuralTPSL(dir, entryP, high24, low24);
 
   if (liveModeActive) {
     if (!liveCredentials || !liveCredentials.apiKey) {
@@ -529,7 +677,9 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
     const orderRes = await placeLiveOrder(liveCredentials, {
       symbol: sym,
       direction: dir,
-      size: '1',
+      price: entryP,
+      presetStopLossPrice: structTPSL.stop_loss,
+      presetTakeProfitPrice: structTPSL.tp_legs[0].price,
     });
 
     if (orderRes.error) {
@@ -537,35 +687,29 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
       return res.status(400).json({ error: orderRes.error });
     }
 
-    addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API`);
+    addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API (SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
     return res.json({ success: true, mode: 'live', symbol: sym, direction: dir, data: orderRes.data });
   }
 
   // Demo mode trade execution
   const demoTrades = getActiveOpenTrades();
-  const isBullish = dir === 'long';
-  const entryP = execPrice > 0 ? execPrice : 100;
-
   const newTrade = {
     id: Date.now(),
     symbol: sym,
     direction: dir as 'long' | 'short',
     entry_price: entryP,
     current_price: entryP,
-    stop_loss: isBullish ? Math.round(entryP * 0.98 * 1000) / 1000 : Math.round(entryP * 1.02 * 1000) / 1000,
-    position_size: settings.risk_per_trade || 25,
-    confidence: 0.88,
-    sl_reason: 'Manual Signal Execution',
+    stop_loss: structTPSL.stop_loss,
+    position_size: settings.risk_per_trade_pct || 1.0,
+    confidence: sig?.confidence || 0.88,
+    sl_reason: structTPSL.sl_reason,
     breakeven_applied: 0,
     dry_run: true,
-    tp_legs: [
-      { level: 1, price: isBullish ? Math.round(entryP * 1.015 * 1000) / 1000 : Math.round(entryP * 0.985 * 1000) / 1000, close_fraction: 0.5, hit: 0, reason: 'TP1 Target' },
-      { level: 2, price: isBullish ? Math.round(entryP * 1.03 * 1000) / 1000 : Math.round(entryP * 0.97 * 1000) / 1000, close_fraction: 0.5, hit: 0, reason: 'TP2 Target' },
-    ],
+    tp_legs: structTPSL.tp_legs,
   };
 
   demoTrades.unshift(newTrade);
-  addLog('info', 'api', `[DEMO EXECUTED] New position opened for ${sym} ${dir.toUpperCase()} @ $${entryP}`);
+  addLog('info', 'api', `[DEMO EXECUTED] New position opened for ${sym} ${dir.toUpperCase()} @ $${entryP} (SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
   return res.json({ success: true, mode: 'dry_run', trade: newTrade });
 });
 
@@ -787,6 +931,8 @@ async function scanCoinsAndGenerateSignals() {
         if (confidence < minThreshold) reasons.push(`Filtered: Confidence (${Math.round(confidence * 100)}%) below ${Math.round(minThreshold * 100)}% threshold`);
       }
 
+      const structTPSL = computeStructuralTPSL(direction, price, high24, low24);
+
       const newSig = {
         id: Date.now() + Math.random(),
         symbol: sym,
@@ -796,6 +942,11 @@ async function scanCoinsAndGenerateSignals() {
         ts: Math.floor(Date.now() / 1000),
         reasons,
         price,
+        high24,
+        low24,
+        stop_loss: structTPSL.stop_loss,
+        sl_reason: structTPSL.sl_reason,
+        tp_legs: structTPSL.tp_legs,
         timeframe: settings.timeframe || '15m',
       };
 
@@ -804,7 +955,7 @@ async function scanCoinsAndGenerateSignals() {
       newSignalsCreated++;
 
       const logMsg = passesFilters 
-        ? `[QUALIFIED SIGNAL] ${sym} ${direction.toUpperCase()} @ $${price.toFixed(price > 10 ? 2 : 4)} (Confidence: ${Math.round(confidence * 100)}%)`
+        ? `[QUALIFIED SIGNAL] ${sym} ${direction.toUpperCase()} @ $${price.toFixed(price > 10 ? 2 : 4)} (Confidence: ${Math.round(confidence * 100)}%) | SL: $${structTPSL.stop_loss} | TP1: $${structTPSL.tp_legs[0].price}`
         : `[FILTERED SIGNAL] ${sym} ${direction.toUpperCase()} @ $${price.toFixed(price > 10 ? 2 : 4)} (Confidence: ${Math.round(confidence * 100)}% - Filtered Out)`;
       addLog('info', sourceTag, logMsg);
 
@@ -812,12 +963,18 @@ async function scanCoinsAndGenerateSignals() {
       if (passesFilters && botRunning) {
         if (liveModeActive) {
           if (liveCredentials && liveCredentials.apiKey) {
-            placeLiveOrder(liveCredentials, { symbol: sym, direction, size: '' })
+            placeLiveOrder(liveCredentials, {
+              symbol: sym,
+              direction,
+              price,
+              presetStopLossPrice: structTPSL.stop_loss,
+              presetTakeProfitPrice: structTPSL.tp_legs[0].price,
+            })
               .then((res) => {
                 if (res.error) {
                   addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${res.error}`);
                 } else {
-                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API`);
+                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
                   autoTradesExecuted++;
                 }
               })
@@ -834,19 +991,16 @@ async function scanCoinsAndGenerateSignals() {
               direction,
               entry_price: price,
               current_price: price,
-              stop_loss: isBullish ? Math.round(price * 0.98 * 1000) / 1000 : Math.round(price * 1.02 * 1000) / 1000,
+              stop_loss: structTPSL.stop_loss,
               position_size: settings.risk_per_trade_pct || 1.0,
               confidence,
-              sl_reason: 'Automated SMC Signal Engine Entry',
+              sl_reason: structTPSL.sl_reason,
               breakeven_applied: 0,
               dry_run: true,
-              tp_legs: [
-                { id: Date.now() + 1, level: 1, price: isBullish ? Math.round(price * 1.015 * 1000) / 1000 : Math.round(price * 0.985 * 1000) / 1000, close_fraction: 0.5, hit: 0, reason: 'TP1 Target' },
-                { id: Date.now() + 2, level: 2, price: isBullish ? Math.round(price * 1.03 * 1000) / 1000 : Math.round(price * 0.97 * 1000) / 1000, close_fraction: 0.5, hit: 0, reason: 'TP2 Target' },
-              ],
+              tp_legs: structTPSL.tp_legs,
             });
             autoTradesExecuted++;
-            addLog('info', 'demo_auto_trade', `[DEMO AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} @ $${price}`);
+            addLog('info', 'demo_auto_trade', `[DEMO AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} @ $${price} (SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
           }
         }
       }

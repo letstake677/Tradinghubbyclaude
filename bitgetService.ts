@@ -267,24 +267,50 @@ export async function fetchPublicMarketTickers(symbols?: string[]) {
   }
 }
 
-export function getStandardContractSize(symbol: string, requestedSize?: string): string {
-  if (requestedSize && parseFloat(requestedSize) > 0) return requestedSize;
+export function getStandardContractSize(symbol: string, price?: number, requestedSize?: string): string {
+  if (requestedSize && parseFloat(requestedSize) > 0) return String(requestedSize);
   const sym = symbol.toUpperCase().replace('USDT', '');
-  switch (sym) {
-    case 'BTC': return '0.001';
-    case 'ETH': return '0.01';
-    case 'SOL': return '0.1';
-    case 'XRP': return '10';
-    case 'DOGE': return '100';
-    case 'ADA': return '10';
-    case 'BNB': return '0.1';
-    case 'AVAX': return '0.5';
-    case 'LINK': return '1';
-    case 'SUI': return '10';
-    case 'PEPE': return '100000';
-    case 'SHIB': return '100000';
-    default: return '1';
+  
+  // Specific override table for major coins
+  const knownSizes: Record<string, string> = {
+    BTC: '0.001',
+    ETH: '0.01',
+    SOL: '0.1',
+    BNB: '0.1',
+    XRP: '10',
+    DOGE: '100',
+    ADA: '10',
+    AVAX: '0.5',
+    LINK: '1',
+    SUI: '10',
+    DOT: '1',
+    NEAR: '1',
+    APT: '1',
+    PEPE: '100000',
+    SHIB: '100000',
+    FLOKI: '10000',
+    BONK: '100000',
+  };
+
+  if (knownSizes[sym]) {
+    return knownSizes[sym];
   }
+
+  // Universal Dynamic Sizing based on price level (aiming for ~$5 - $10 minimum order value on Bitget)
+  if (price && price > 0) {
+    if (price >= 10000) return '0.001';
+    if (price >= 1000) return '0.01';
+    if (price >= 100) return '0.1';
+    if (price >= 10) return '1';
+    if (price >= 1) return '10';
+    if (price >= 0.1) return '100';
+    if (price >= 0.01) return '1000';
+    if (price >= 0.001) return '10000';
+    if (price >= 0.0001) return '100000';
+    return '1000000';
+  }
+
+  return '1';
 }
 
 export async function placeLiveOrder(
@@ -293,13 +319,16 @@ export async function placeLiveOrder(
     symbol: string;
     direction: 'long' | 'short';
     size?: string;
+    price?: number;
+    presetStopLossPrice?: number | string;
+    presetTakeProfitPrice?: number | string;
     marginMode?: string;
   }
 ) {
   try {
     const side = params.direction === 'long' ? 'buy' : 'sell';
-    const sizeToUse = getStandardContractSize(params.symbol, params.size);
-    const payload = {
+    const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
+    const payload: Record<string, any> = {
       productType: 'USDT-FUTURES',
       symbol: params.symbol,
       marginCoin: 'USDT',
@@ -308,6 +337,13 @@ export async function placeLiveOrder(
       orderType: 'market',
       marginMode: params.marginMode || 'crossed',
     };
+
+    if (params.presetStopLossPrice) {
+      payload.presetStopLossPrice = String(params.presetStopLossPrice);
+    }
+    if (params.presetTakeProfitPrice) {
+      payload.presetTakeProfitPrice = String(params.presetTakeProfitPrice);
+    }
 
     const res = await bitgetApiRequest(
       '/api/v2/mix/order/place-order',
