@@ -707,7 +707,7 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
       price: entryP,
       leverage: settings.leverage || 5,
       presetStopLossPrice: structTPSL.stop_loss,
-      presetTakeProfitPrice: structTPSL.tp_legs[0].price,
+      tp_legs: structTPSL.tp_legs,
     });
 
     if (orderRes.error) {
@@ -1044,7 +1044,7 @@ async function scanCoinsAndGenerateSignals() {
                   price,
                   leverage: settings.leverage || 5,
                   presetStopLossPrice: structTPSL.stop_loss,
-                  presetTakeProfitPrice: structTPSL.tp_legs[0].price,
+                  tp_legs: structTPSL.tp_legs,
                 });
                 if (orderRes.error) {
                   addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${orderRes.error}`);

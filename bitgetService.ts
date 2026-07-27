@@ -503,6 +503,7 @@ export async function placeLiveOrder(
     leverage?: number;
     presetStopLossPrice?: number | string;
     presetTakeProfitPrice?: number | string;
+    tp_legs?: Array<{ price: number; close_fraction: number }>;
     marginMode?: string;
     tradeSide?: string;
   }
@@ -537,34 +538,49 @@ export async function placeLiveOrder(
             payload.presetStopLossPrice = formatPriceForBitget(params.symbol, numSL);
           }
         }
-        if (params.presetTakeProfitPrice) {
-          const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
-          if (!isNaN(numTP) && numTP > 0) {
-            payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
+        // Only set presetTakeProfitPrice if no multiple tp_legs are provided
+        if (!params.tp_legs || params.tp_legs.length === 0) {
+          if (params.presetTakeProfitPrice) {
+            const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
+            if (!isNaN(numTP) && numTP > 0) {
+              payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
+            }
           }
         }
       }
       return payload;
     };
 
+    let presetSLWasSet = false;
+
     // Attempt 1: Hedge Mode ('open') + TP/SL
     let payload = buildPayload('open', true);
     let res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+    if (res.code === '00000') {
+      presetSLWasSet = !!payload.presetStopLossPrice;
+    }
 
     // Attempt 2: One-Way Mode (omit tradeSide) + TP/SL if attempt 1 returned mode/side mismatch error
     if (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side mismatch') || res.msg.toLowerCase().includes('unilateral')))) {
       payload = buildPayload(undefined, true);
       res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+      if (res.code === '00000') {
+        presetSLWasSet = !!payload.presetStopLossPrice;
+      }
     }
 
     // Attempt 3: If tick size / price precision error (e.g. 45115), retry without preset TP/SL as fallback
     if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
       payload = buildPayload('open', false);
       res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-
-      if (res.code !== '00000') {
+      if (res.code === '00000') {
+        presetSLWasSet = false;
+      } else {
         payload = buildPayload(undefined, false);
         res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+        if (res.code === '00000') {
+          presetSLWasSet = false;
+        }
       }
     }
 
@@ -577,8 +593,56 @@ export async function placeLiveOrder(
     let tpError = null;
     let slError = null;
     
-    // Attach explicit TP and SL plan orders to guarantee Bitget shows TP 1 / SL 1 on position
-    if (params.presetTakeProfitPrice) {
+    // Attach explicit TP plan orders. If tp_legs is specified, we place all of them with proper fractional size formatting.
+    if (params.tp_legs && params.tp_legs.length > 0) {
+      const numTotalSize = parseFloat(sizeToUse);
+      const dotIndex = sizeToUse.indexOf('.');
+      const precision = dotIndex === -1 ? 0 : sizeToUse.length - dotIndex - 1;
+
+      let remainingSize = numTotalSize;
+      const legSizes: string[] = [];
+
+      for (let i = 0; i < params.tp_legs.length; i++) {
+        const leg = params.tp_legs[i];
+        if (i === params.tp_legs.length - 1) {
+          legSizes.push(remainingSize.toFixed(precision));
+        } else {
+          const rawFraction = leg.close_fraction || (1 / params.tp_legs.length);
+          const rawLegSize = numTotalSize * rawFraction;
+          let roundedSize = parseFloat(rawLegSize.toFixed(precision));
+          if (roundedSize === 0 && remainingSize > 0) {
+            roundedSize = Math.min(remainingSize, parseFloat((1 / Math.pow(10, precision)).toFixed(precision)));
+          }
+          legSizes.push(roundedSize.toFixed(precision));
+          remainingSize = Math.max(0, remainingSize - roundedSize);
+        }
+      }
+
+      const tpResults = [];
+      for (let i = 0; i < params.tp_legs.length; i++) {
+        const leg = params.tp_legs[i];
+        const legSizeStr = legSizes[i];
+        if (parseFloat(legSizeStr) > 0) {
+          const tpRes = await placeLiveTPSL(creds, {
+            symbol: params.symbol,
+            holdSide: params.direction,
+            planType: 'profit_plan',
+            triggerPrice: leg.price,
+            size: legSizeStr,
+          });
+          if (tpRes.error) {
+            tpResults.push({ success: false, error: tpRes.error, price: leg.price });
+          } else {
+            tpResults.push({ success: true, price: leg.price, size: legSizeStr });
+          }
+        }
+      }
+      if (tpResults.some(r => r.success)) {
+        tpError = tpResults.filter(r => !r.success).map(r => `${r.price}: ${r.error}`).join('; ') || null;
+      } else if (tpResults.length > 0) {
+        tpError = tpResults.map(r => `${r.price}: ${r.error}`).join('; ');
+      }
+    } else if (params.presetTakeProfitPrice) {
       const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
       if (!isNaN(numTP) && numTP > 0) {
         const tpRes = await placeLiveTPSL(creds, {
@@ -591,7 +655,9 @@ export async function placeLiveOrder(
         if (tpRes.error) tpError = tpRes.error;
       }
     }
-    if (params.presetStopLossPrice) {
+
+    // Attach explicit SL plan order ONLY if it wasn't successfully set on the initial order
+    if (params.presetStopLossPrice && !presetSLWasSet) {
       const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
       if (!isNaN(numSL) && numSL > 0) {
         const slRes = await placeLiveTPSL(creds, {
