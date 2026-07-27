@@ -366,9 +366,8 @@ export async function placeLiveOrder(
   try {
     const side = params.direction === 'long' ? 'buy' : 'sell';
     const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
-    const primaryTradeSide = params.tradeSide || 'one_way';
 
-    const buildPayload = (tSide: string, includeTPSL = true) => {
+    const buildPayload = (tSide?: string, includeTPSL = true) => {
       const payload: Record<string, any> = {
         productType: 'USDT-FUTURES',
         symbol: params.symbol,
@@ -376,9 +375,12 @@ export async function placeLiveOrder(
         size: sizeToUse,
         side: side,
         orderType: 'market',
-        tradeSide: tSide,
         marginMode: params.marginMode || 'crossed',
       };
+
+      if (tSide) {
+        payload.tradeSide = tSide;
+      }
 
       if (includeTPSL) {
         if (params.presetStopLossPrice) {
@@ -397,21 +399,32 @@ export async function placeLiveOrder(
       return payload;
     };
 
-    // First attempt with primary tradeSide (one_way) & formatted TP/SL
-    let payload = buildPayload(primaryTradeSide, true);
+    // Attempt 1: Hedge Mode ('open') + TP/SL (Most common for Bitget Futures)
+    let payload = buildPayload('open', true);
     let res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
 
-    // If error 40774 or position mode error, try hedge mode tradeSide 'open'
-    if (res.code === '40774' || (res.msg && res.msg.toLowerCase().includes('unilateral'))) {
-      const fallbackTradeSide = primaryTradeSide === 'one_way' ? 'open' : 'one_way';
-      payload = buildPayload(fallbackTradeSide, true);
-      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+    if (res.code === '00000') {
+      return { success: true, data: res.data };
     }
 
-    // If error 45115 or TP/SL error, try placing order without preset TP/SL as safety fallback
-    if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
-      payload = buildPayload(primaryTradeSide, false);
+    // Attempt 2: One-Way Mode (omit tradeSide) + TP/SL if attempt 1 returned mode/side mismatch error
+    if (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side mismatch') || res.msg.toLowerCase().includes('unilateral')))) {
+      payload = buildPayload(undefined, true);
       res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+      if (res.code === '00000') {
+        return { success: true, data: res.data };
+      }
+    }
+
+    // Attempt 3: If tick size / price precision error (e.g. 45115), retry without preset TP/SL as fallback
+    if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
+      payload = buildPayload('open', false);
+      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+
+      if (res.code !== '00000') {
+        payload = buildPayload(undefined, false);
+        res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+      }
     }
 
     if (res.code !== '00000') {
