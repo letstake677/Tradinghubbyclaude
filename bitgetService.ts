@@ -236,6 +236,98 @@ export async function fetchLiveOrderHistory(creds: BitgetCredentials) {
   }
 }
 
+export async function fetchPublicMarketTickers(symbols?: string[]) {
+  try {
+    const res = await fetch(`${BITGET_BASE_URL}/api/v2/mix/market/tickers?productType=USDT-FUTURES`);
+    const json = await res.json();
+    if (json.code !== '00000' || !Array.isArray(json.data)) {
+      return { error: `Bitget Public Ticker Error (${json.code}): ${json.msg || 'Unknown'}` };
+    }
+
+    let list = json.data;
+    if (symbols && symbols.length > 0) {
+      const cleanSet = new Set(
+        symbols.map((s) => s.replace(/[\/\-\s]/g, '').toUpperCase())
+      );
+      list = list.filter((item: any) => {
+        const itemSym = item.symbol?.toUpperCase() || '';
+        if (cleanSet.has(itemSym)) return true;
+        for (const userSym of cleanSet) {
+          if (itemSym === userSym + 'USDT' || itemSym === userSym || userSym === itemSym.replace('USDT', '')) {
+            return true;
+          }
+        }
+        return false;
+      });
+    }
+
+    return { success: true, tickers: list };
+  } catch (err: any) {
+    return { error: `Network error fetching Bitget tickers: ${err.message || String(err)}` };
+  }
+}
+
+export function getStandardContractSize(symbol: string, requestedSize?: string): string {
+  if (requestedSize && parseFloat(requestedSize) > 0) return requestedSize;
+  const sym = symbol.toUpperCase().replace('USDT', '');
+  switch (sym) {
+    case 'BTC': return '0.001';
+    case 'ETH': return '0.01';
+    case 'SOL': return '0.1';
+    case 'XRP': return '10';
+    case 'DOGE': return '100';
+    case 'ADA': return '10';
+    case 'BNB': return '0.1';
+    case 'AVAX': return '0.5';
+    case 'LINK': return '1';
+    case 'SUI': return '10';
+    case 'PEPE': return '100000';
+    case 'SHIB': return '100000';
+    default: return '1';
+  }
+}
+
+export async function placeLiveOrder(
+  creds: BitgetCredentials,
+  params: {
+    symbol: string;
+    direction: 'long' | 'short';
+    size?: string;
+    marginMode?: string;
+  }
+) {
+  try {
+    const side = params.direction === 'long' ? 'buy' : 'sell';
+    const sizeToUse = getStandardContractSize(params.symbol, params.size);
+    const payload = {
+      productType: 'USDT-FUTURES',
+      symbol: params.symbol,
+      marginCoin: 'USDT',
+      size: sizeToUse,
+      side: side,
+      orderType: 'market',
+      marginMode: params.marginMode || 'crossed',
+    };
+
+    const res = await bitgetApiRequest(
+      '/api/v2/mix/order/place-order',
+      'POST',
+      payload,
+      creds
+    );
+
+    if (res.code !== '00000') {
+      return {
+        error: `Bitget Order Error (${res.code}): ${res.msg || 'Failed to place order on Bitget'}`,
+      };
+    }
+
+    return { success: true, data: res.data };
+  } catch (err: any) {
+    return { error: `Network/Bitget Order Error: ${err.message || String(err)}` };
+  }
+}
+
 export async function closeLivePosition(creds: BitgetCredentials, symbol: string) {
   try {
     const res = await bitgetApiRequest(

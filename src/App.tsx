@@ -237,16 +237,35 @@ function PositionCard({ pos, apiBase, onClose }: { pos: any; apiBase: string; on
   );
 }
 
-function SignalRow({ s }: { s: any }) {
+function SignalRow({ s, onExecuteTrade }: { s: any; onExecuteTrade?: (s: any) => void }) {
+  const [executing, setExecuting] = useState(false);
   const dirColor = s.direction === 'long' ? C.long : C.short;
+
+  const handleExec = async () => {
+    if (!onExecuteTrade) return;
+    setExecuting(true);
+    await onExecuteTrade(s);
+    setExecuting(false);
+  };
+
   return (
     <div className="p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 text-sm">
       <div className="flex flex-col gap-1.5 min-w-0">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="font-bold flex-shrink-0 text-xs px-2 py-0.5 rounded" style={{ background: `${dirColor}22`, color: dirColor }}>
             {s.direction.toUpperCase()}
           </span>
           <span className="font-display font-semibold" style={{ color: C.paper }}>{s.symbol}</span>
+          {s.price && (
+            <span className="text-xs font-mono-data font-bold" style={{ color: C.amber }}>
+              @ ${Number(s.price).toFixed(Number(s.price) > 10 ? 2 : 4)}
+            </span>
+          )}
+          {s.timeframe && (
+            <span className="text-[10px] px-1.5 py-0.2 rounded font-mono-data" style={{ background: C.panelAlt, color: C.muted }}>
+              {s.timeframe}
+            </span>
+          )}
           <span className="text-xs font-mono-data ml-auto md:ml-0" style={{ color: C.muted }}>{timeAgo(s.ts)}</span>
         </div>
         <div className="flex flex-wrap gap-1.5 mt-1">
@@ -265,12 +284,27 @@ function SignalRow({ s }: { s: any }) {
         <div className="w-16 h-2 rounded-full overflow-hidden" style={{ background: C.hairline }}>
           <div className="h-full rounded-full" style={{ width: `${s.confidence * 100}%`, background: C.amber }} />
         </div>
-        <span className="text-xs px-2.5 py-1 rounded font-medium whitespace-nowrap" style={{
-          background: s.taken === 1 ? `${C.long}22` : C.panelAlt,
-          color: s.taken === 1 ? C.long : C.muted,
+        
+        <span className="text-[11px] px-2 py-0.5 rounded font-medium whitespace-nowrap" style={{
+          background: s.taken === 1 ? `${C.long}22` : `${C.short}22`,
+          color: s.taken === 1 ? C.long : C.short,
+          border: `1px solid ${s.taken === 1 ? `${C.long}44` : `${C.short}44`}`
         }}>
-          {s.taken === 1 ? 'Taken' : 'Filtered'}
+          {s.taken === 1 ? '✓ Qualified' : '✕ Filtered'}
         </span>
+
+        <button
+          onClick={handleExec}
+          disabled={executing}
+          className="text-xs px-2.5 py-1 rounded font-semibold flex items-center gap-1.5 transition-all disabled:opacity-50 hover:brightness-110 cursor-pointer shadow-sm"
+          style={{
+            background: dirColor,
+            color: '#0e1117',
+          }}
+        >
+          {executing ? <RefreshCw size={11} className="animate-spin" /> : <Play size={11} fill="currentColor" />}
+          {executing ? 'Executing...' : 'Execute Trade'}
+        </button>
       </div>
     </div>
   );
@@ -780,6 +814,7 @@ export default function KehloDashboard() {
   const [activeTab, setActiveTab] = useState('positions');
   const [logFilter, setLogFilter] = useState('all');
   const [syncing, setSyncing] = useState(false);
+  const [scanningNow, setScanningNow] = useState(false);
 
   const status = usePolling(useCallback(() => apiGet(apiBase, '/api/status'), [apiBase]), 5000);
   const openTrades = usePolling(useCallback(() => apiGet(apiBase, '/api/trades/open'), [apiBase]), 5000);
@@ -804,6 +839,38 @@ export default function KehloDashboard() {
       console.error(e);
     } finally {
       setTimeout(() => setSyncing(false), 600);
+    }
+  };
+
+  const handleScanNow = async () => {
+    setScanningNow(true);
+    try {
+      await apiPost(apiBase, '/api/bot/scan');
+      await Promise.all([signalsQ.refetch(), logsQ.refetch(), status.refetch()]);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => setScanningNow(false), 500);
+    }
+  };
+
+  const handleExecuteTrade = async (s: any) => {
+    try {
+      await apiPost(apiBase, '/api/trades/execute', {
+        symbol: s.symbol,
+        direction: s.direction,
+        price: s.price,
+        signal_id: s.id,
+      });
+      await Promise.all([
+        openTrades.refetch(),
+        signalsQ.refetch(),
+        logsQ.refetch(),
+        status.refetch(),
+        balanceQ.refetch(),
+      ]);
+    } catch (e) {
+      console.error('Execute trade error:', e);
     }
   };
 
@@ -1175,14 +1242,36 @@ export default function KehloDashboard() {
         )}
 
         {activeTab === 'signals' && (
-          <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg max-w-3xl divide-y">
-            {signalsQ.loading && !signalsQ.data ? (
-              <div className="p-4 text-xs font-mono-data" style={{ color: C.muted }}>Loading market signals…</div>
-            ) : (signalsQ.data || []).length === 0 ? (
-              <div className="p-8 text-xs font-mono-data text-center" style={{ color: C.muted }}>No signals recorded.</div>
-            ) : (signalsQ.data || []).map((s: any, i: number) => (
-              <SignalRow key={s.id ?? i} s={s} />
-            ))}
+          <div className="max-w-3xl space-y-3">
+            <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg p-4 flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider flex items-center gap-2" style={{ color: C.amber }}>
+                  <Zap size={14} /> Live Market Signals & Coin Scanner Feed
+                </h3>
+                <p className="text-[11px] font-mono-data mt-1" style={{ color: C.muted }}>
+                  Scanning coins: <span className="text-gray-300 font-semibold">{symbolsText || 'BTCUSDT, ETHUSDT, SOLUSDT, DOGEUSDT'}</span>
+                </p>
+              </div>
+
+              <button onClick={handleScanNow} disabled={scanningNow}
+                className="px-3.5 py-1.5 rounded text-xs font-semibold flex items-center gap-1.5 transition-all disabled:opacity-50"
+                style={{ background: C.amber, color: C.bg }}>
+                <RefreshCw size={12} className={scanningNow ? 'animate-spin' : ''} />
+                {scanningNow ? 'Scanning Bitget Coins…' : 'Scan Market Now'}
+              </button>
+            </div>
+
+            <div style={{ background: C.panel, border: `1px solid ${C.hairline}` }} className="rounded-lg divide-y">
+              {signalsQ.loading && !signalsQ.data ? (
+                <div className="p-4 text-xs font-mono-data" style={{ color: C.muted }}>Loading market signals…</div>
+              ) : (signalsQ.data || []).length === 0 ? (
+                <div className="p-8 text-xs font-mono-data text-center" style={{ color: C.muted }}>
+                  No signals recorded yet. Click "Scan Market Now" above to analyze live coins.
+                </div>
+              ) : (signalsQ.data || []).map((s: any, i: number) => (
+                <SignalRow key={s.id ?? i} s={s} onExecuteTrade={handleExecuteTrade} />
+              ))}
+            </div>
           </div>
         )}
 
