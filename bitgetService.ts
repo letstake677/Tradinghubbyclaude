@@ -313,6 +313,43 @@ export function getStandardContractSize(symbol: string, price?: number, requeste
   return '1';
 }
 
+export function formatPriceForBitget(symbol: string, price: number): string {
+  if (!price || isNaN(price)) return '';
+  const sym = symbol.toUpperCase().replace('USDT', '');
+  
+  // Specific symbol tick precision rules on Bitget
+  const tickDecimals: Record<string, number> = {
+    BTC: 1,
+    ETH: 2,
+    SOL: 2,
+    BNB: 2,
+    AVAX: 2,
+    LINK: 3,
+    XRP: 4,
+    ADA: 4,
+    SUI: 4,
+    DOT: 2,
+    NEAR: 3,
+    APT: 3,
+    DOGE: 5,
+    PEPE: 8,
+    SHIB: 8,
+    FLOKI: 8,
+    BONK: 8,
+  };
+
+  let decimals = tickDecimals[sym];
+  if (decimals === undefined) {
+    if (price >= 10000) decimals = 1;
+    else if (price >= 100) decimals = 2;
+    else if (price >= 1) decimals = 3;
+    else if (price >= 0.01) decimals = 5;
+    else decimals = 8;
+  }
+
+  return price.toFixed(decimals);
+}
+
 export async function placeLiveOrder(
   creds: BitgetCredentials,
   params: {
@@ -323,34 +360,59 @@ export async function placeLiveOrder(
     presetStopLossPrice?: number | string;
     presetTakeProfitPrice?: number | string;
     marginMode?: string;
+    tradeSide?: string;
   }
 ) {
   try {
     const side = params.direction === 'long' ? 'buy' : 'sell';
     const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
-    const payload: Record<string, any> = {
-      productType: 'USDT-FUTURES',
-      symbol: params.symbol,
-      marginCoin: 'USDT',
-      size: sizeToUse,
-      side: side,
-      orderType: 'market',
-      marginMode: params.marginMode || 'crossed',
+    const primaryTradeSide = params.tradeSide || 'one_way';
+
+    const buildPayload = (tSide: string, includeTPSL = true) => {
+      const payload: Record<string, any> = {
+        productType: 'USDT-FUTURES',
+        symbol: params.symbol,
+        marginCoin: 'USDT',
+        size: sizeToUse,
+        side: side,
+        orderType: 'market',
+        tradeSide: tSide,
+        marginMode: params.marginMode || 'crossed',
+      };
+
+      if (includeTPSL) {
+        if (params.presetStopLossPrice) {
+          const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
+          if (!isNaN(numSL) && numSL > 0) {
+            payload.presetStopLossPrice = formatPriceForBitget(params.symbol, numSL);
+          }
+        }
+        if (params.presetTakeProfitPrice) {
+          const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
+          if (!isNaN(numTP) && numTP > 0) {
+            payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
+          }
+        }
+      }
+      return payload;
     };
 
-    if (params.presetStopLossPrice) {
-      payload.presetStopLossPrice = String(params.presetStopLossPrice);
-    }
-    if (params.presetTakeProfitPrice) {
-      payload.presetTakeProfitPrice = String(params.presetTakeProfitPrice);
+    // First attempt with primary tradeSide (one_way) & formatted TP/SL
+    let payload = buildPayload(primaryTradeSide, true);
+    let res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+
+    // If error 40774 or position mode error, try hedge mode tradeSide 'open'
+    if (res.code === '40774' || (res.msg && res.msg.toLowerCase().includes('unilateral'))) {
+      const fallbackTradeSide = primaryTradeSide === 'one_way' ? 'open' : 'one_way';
+      payload = buildPayload(fallbackTradeSide, true);
+      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
     }
 
-    const res = await bitgetApiRequest(
-      '/api/v2/mix/order/place-order',
-      'POST',
-      payload,
-      creds
-    );
+    // If error 45115 or TP/SL error, try placing order without preset TP/SL as safety fallback
+    if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
+      payload = buildPayload(primaryTradeSide, false);
+      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
+    }
 
     if (res.code !== '00000') {
       return {
