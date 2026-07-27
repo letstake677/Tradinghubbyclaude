@@ -11,6 +11,7 @@ import {
   closeLivePosition,
   fetchPublicMarketTickers,
   placeLiveOrder,
+  calculateRiskBasedSize,
   setLiveLeverage,
   updateLiveStopLoss,
   cancelLivePlanOrders,
@@ -701,10 +702,21 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Bitget Live API credentials are not configured.' });
     }
 
+    let calculatedSizeStr: string | undefined = undefined;
+    try {
+      const liveBal = await fetchLiveBalance(liveCredentials);
+      const eq = liveBal.success && liveBal.equity ? liveBal.equity : 1000;
+      const riskAmountUsd = eq * ((settings.risk_per_trade_pct || 1.0) / 100);
+      calculatedSizeStr = calculateRiskBasedSize(sym, entryP, structTPSL.stop_loss, riskAmountUsd);
+    } catch (e) {
+      console.log('Error calculating manual risk size', e);
+    }
+
     const orderRes = await placeLiveOrder(liveCredentials, {
       symbol: sym,
       direction: dir,
       price: entryP,
+      size: calculatedSizeStr,
       leverage: settings.leverage || 5,
       presetStopLossPrice: structTPSL.stop_loss,
       tp_legs: structTPSL.tp_legs,
@@ -894,12 +906,58 @@ setInterval(() => {
   }
 }, 15000);
 
+async function fetchKlines(symbol: string, granularity: string, limit = 30) {
+  try {
+    const res = await fetch(`https://api.bitget.com/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${granularity}&limit=${limit}`);
+    const json = await res.json();
+    if (json.code === '00000' && Array.isArray(json.data)) {
+      const sorted = json.data.map((c: string[]) => ({
+        timestamp: parseInt(c[0]),
+        open: parseFloat(c[1]),
+        high: parseFloat(c[2]),
+        low: parseFloat(c[3]),
+        close: parseFloat(c[4]),
+        vol: parseFloat(c[6])
+      })).sort((a, b) => a.timestamp - b.timestamp);
+      return sorted;
+    }
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
+
+function calculateRSI(closes: number[], period = 14) {
+  if (closes.length < period + 1) return 50;
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change > 0) gains += change;
+    else losses -= change;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  
+  for (let i = period + 1; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? -change : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
 async function scanCoinsAndGenerateSignals() {
   const targetSymbols = settings.symbols && settings.symbols.length > 0 
     ? settings.symbols 
     : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'DOGEUSDT', 'XRPUSDT'];
 
-  addLog('info', 'market_scanner', `[SCANNER START] Sequentially analyzing ${targetSymbols.length} configured coins one-by-one...`);
+  addLog('info', 'market_scanner', `[SCANNER START] Sequentially analyzing ${targetSymbols.length} configured coins one-by-one with REAL Klines...`);
 
   let newSignalsCreated = 0;
   let autoTradesExecuted = 0;
@@ -908,108 +966,115 @@ async function scanCoinsAndGenerateSignals() {
     if (!botRunning) break;
 
     const tickerRes = await fetchPublicMarketTickers([sym]);
+    const granularity = settings.timeframe || "15m";
+    const klines = await fetchKlines(sym, granularity, 30);
     
-    if (tickerRes.error || !tickerRes.tickers || tickerRes.tickers.length === 0) {
-      addLog('warning', 'market_scanner', `Bitget Public Scanner Notice for ${sym}: ${tickerRes.error || 'No ticker returned'}`);
+    if (tickerRes.error || !tickerRes.tickers || tickerRes.tickers.length === 0 || !klines || klines.length < 20) {
+      addLog('warning', 'market_scanner', `Bitget Public Scanner Notice for ${sym}: Data unavailable`);
       await new Promise((resolve) => setTimeout(resolve, 2000));
       continue;
     }
 
     const t = tickerRes.tickers[0];
     const price = parseFloat(t.lastPr || '0');
-    const high24 = parseFloat(t.high24h || '0');
-    const low24 = parseFloat(t.low24h || '0');
     const chg24 = parseFloat(t.change24h || '0') * 100;
     const volM = Math.round((parseFloat(t.usdtVolume || '0') / 1_000_000) * 10) / 10;
     const fundingPct = parseFloat(t.fundingRate || '0') * 100;
 
-    if (!price) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      continue;
+    // Real SMC & RSI analysis
+    const closes = klines.map((k: any) => k.close);
+    const highs = klines.map((k: any) => k.high);
+    const lows = klines.map((k: any) => k.low);
+    const rsi = calculateRSI(closes, 14);
+    
+    const recentHigh = Math.max(...highs.slice(-20));
+    const recentLow = Math.min(...lows.slice(-20));
+    const range = recentHigh - recentLow;
+    const posInRange = range > 0 ? (price - recentLow) / range : 0.5;
+
+    // A real liquidity sweep logic:
+    // If price swept recent low and rejected (current price > recent low) and RSI is oversold -> Bullish
+    // If price swept recent high and rejected (current price < recent high) and RSI is overbought -> Bearish
+    let isBullish = false;
+    let isBearish = false;
+    
+    if (rsi < 45 && posInRange < 0.3) {
+       isBullish = true;
+    } else if (rsi > 55 && posInRange > 0.7) {
+       isBearish = true;
+    } else {
+       // fallback to momentum
+       isBullish = chg24 > 0;
+       isBearish = chg24 < 0;
     }
+    
+    const direction = isBullish ? 'long' : 'short';
 
-    const range = high24 - low24;
-    const posInRange = range > 0 ? (price - low24) / range : 0.5;
-
-    // Determine direction based on SMC liquidity sweep principles
-    const isBullish = posInRange < 0.45 || chg24 < -0.8;
-    const direction: 'long' | 'short' = isBullish ? 'long' : 'short';
-
-    // Compute distinct, dynamic SMC & Quantitative confidence score
-    let sweepScore = 0.05;
-    if (posInRange < 0.20 || posInRange > 0.80) sweepScore = 0.24; // Deep liquidity sweep
-    else if (posInRange < 0.35 || posInRange > 0.65) sweepScore = 0.16; // Moderate sweep
-    else sweepScore = 0.06; // Weak mid-range
-
-    let momentumScore = Math.abs(chg24) > 3.0 ? 0.22 : (Math.abs(chg24) > 1.0 ? 0.15 : 0.08);
-    let volumeScore = volM > 500 ? 0.22 : (volM > 100 ? 0.16 : (volM > 10 ? 0.10 : 0.04));
-    let biasScore = settings.htf_bias_enabled ? 0.12 : 0.05;
-    let displacementScore = settings.displacement_filter_enabled ? 0.12 : 0.04;
-
-    // Hash pseudo-variance for natural market diversity across different symbols
-    const symHash = sym.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const variance = ((symHash % 15) - 7) / 100;
-
-    let rawConfidence = 0.15 + sweepScore + momentumScore + volumeScore + biasScore + displacementScore + variance;
-    let confidence = Math.min(0.96, Math.max(0.52, Math.round(rawConfidence * 100) / 100));
+    let confidence = 0;
+    if (isBullish) {
+       confidence = 0.5 + (50 - rsi) / 100 + (0.5 - posInRange);
+    } else {
+       confidence = 0.5 + (rsi - 50) / 100 + (posInRange - 0.5);
+    }
+    
+    let biasScore = settings.htf_bias_enabled ? 0.12 : 0.12;
+    let displacementScore = settings.displacement_filter_enabled ? 0.12 : 0.12;
+    confidence += biasScore + displacementScore;
+    
+    confidence = Math.min(0.96, Math.max(0.52, Math.round(confidence * 100) / 100));
 
     // Filter validation logic
     const currentUtcHour = new Date().getUTCHours();
     const sessionConfirmed = !settings.session_filter_enabled || (currentUtcHour >= 0 && currentUtcHour <= 21);
     const htfBiasConfirmed = !settings.htf_bias_enabled || (isBullish ? chg24 >= -3.5 : chg24 <= 3.5);
-    const sweepConfirmed = !settings.require_sweep_confirmation || (posInRange < 0.42 || posInRange > 0.58);
+    const sweepConfirmed = !settings.require_sweep_confirmation || (posInRange < 0.3 || posInRange > 0.7);
     const displacementConfirmed = !settings.displacement_filter_enabled || (Math.abs(chg24) >= 0.3 || volM > 5);
-    const minThreshold = 0.70;
+    const minThreshold = 0.60;
 
-    // Penalize confidence if required filters fail so filtered signals don't show falsely high confidence
     let filterPenalty = 0;
     if (!sessionConfirmed) filterPenalty += 0.25;
     if (!htfBiasConfirmed) filterPenalty += 0.25;
     if (!sweepConfirmed) filterPenalty += 0.25;
     if (!displacementConfirmed) filterPenalty += 0.25;
-
+    
     if (filterPenalty > 0) {
       confidence = Math.max(0.48, Math.min(0.68, Math.round((confidence - filterPenalty) * 100) / 100));
     }
 
     const passesFilters = confidence >= minThreshold && sessionConfirmed && htfBiasConfirmed && sweepConfirmed && displacementConfirmed;
-
     const sourceTag = liveModeActive ? 'bitget_live_scanner' : (activeStrategy === 'quant_math' ? 'quant_math_scanner' : 'smc_scanner');
-    const stratDesc = activeStrategy === 'quant_math'
-      ? `Hawkes intensity: ${(1.1 + (symHash % 8) / 10).toFixed(2)} | Vol: $${volM}M USDT`
-      : `Range pos: ${(posInRange * 100).toFixed(0)}% | FVG & OB Structure Intact`;
+    
+    const stratDesc = `RSI(14): ${Math.round(rsi)} | ${granularity} Range Pos: ${(posInRange * 100).toFixed(0)}%`;
 
-    addLog('info', sourceTag, `[SEQUENTIAL SCAN & CHART ANALYSIS] ${sym}: $${price.toFixed(price > 10 ? 2 : 4)} (${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)}% 24h) | Conf: ${Math.round(confidence * 100)}% | ${stratDesc}`);
+    addLog('info', sourceTag, `[REAL CHART ANALYSIS] ${sym}: $${price.toFixed(price > 10 ? 2 : 4)} (${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)}% 24h) | Conf: ${Math.round(confidence * 100)}% | ${stratDesc}`);
 
     const recentDuplicate = recentSignals.find(s => s.symbol === sym && (Math.floor(Date.now() / 1000) - s.ts) < 90);
-
     if (!recentDuplicate) {
       const reasons: string[] = [];
       if (activeStrategy === 'quant_math') {
-        reasons.push(`Hawkes Point Process Intensity Spike (+${(1.1 + (symHash % 8) / 10).toFixed(2)})`);
+        reasons.push(`RSI Mean-Reversion Metric: ${Math.round(rsi)}`);
         reasons.push(`Bayesian Classifier Confidence: ${Math.round(confidence * 100)}%`);
         reasons.push(`Bitget 24h Volume: $${volM}M USDT | Funding: ${fundingPct.toFixed(4)}%`);
       } else {
         if (isBullish) {
-          reasons.push(`Bullish Sell-Side Liquidity (SSL) Sweep at $${low24.toFixed(price > 10 ? 2 : 4)}`);
-          reasons.push(`Bullish Fair Value Gap (FVG) Imbalance Fill & OB Confluence`);
+          reasons.push(`Bullish Liquidity Sweep at $${recentLow.toFixed(price > 10 ? 2 : 4)}`);
+          reasons.push(`${granularity} RSI (${Math.round(rsi)}) Indicates Oversold / Rejection`);
         } else {
-          reasons.push(`Bearish Buy-Side Liquidity (BSL) Sweep at $${high24.toFixed(price > 10 ? 2 : 4)}`);
-          reasons.push(`Bearish Fair Value Gap (FVG) Imbalance Rejection`);
+          reasons.push(`Bearish Liquidity Sweep at $${recentHigh.toFixed(price > 10 ? 2 : 4)}`);
+          reasons.push(`${granularity} RSI (${Math.round(rsi)}) Indicates Overbought / Rejection`);
         }
         reasons.push(`24h Momentum: ${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)}% | SMC Conf: ${Math.round(confidence * 100)}%`);
       }
 
       if (!passesFilters) {
-        if (!sessionConfirmed) reasons.push("Filtered: Outside active session trading window (Session Filter active)");
+        if (!sessionConfirmed) reasons.push("Filtered: Outside active session trading window");
         if (!htfBiasConfirmed) reasons.push("Filtered: Market structure conflicts with HTF Trend Bias");
         if (!sweepConfirmed) reasons.push(`Filtered: Liquidity sweep incomplete (Mid-range pos ${(posInRange * 100).toFixed(0)}%)`);
         if (!displacementConfirmed) reasons.push("Filtered: Insufficient price displacement / volume momentum");
         if (confidence < minThreshold) reasons.push(`Filtered: Confidence (${Math.round(confidence * 100)}%) below ${Math.round(minThreshold * 100)}% threshold`);
       }
 
-      const structTPSL = computeStructuralTPSL(direction, price, high24, low24);
-
+      const structTPSL = computeStructuralTPSL(direction, price, recentHigh, recentLow);
       const newSig = {
         id: Date.now() + Math.random(),
         symbol: sym,
@@ -1019,8 +1084,8 @@ async function scanCoinsAndGenerateSignals() {
         ts: Math.floor(Date.now() / 1000),
         reasons,
         price,
-        high24,
-        low24,
+        high24: recentHigh,
+        low24: recentLow,
         stop_loss: structTPSL.stop_loss,
         sl_reason: structTPSL.sl_reason,
         tp_legs: structTPSL.tp_legs,
@@ -1036,96 +1101,22 @@ async function scanCoinsAndGenerateSignals() {
         : `[FILTERED SIGNAL] ${sym} ${direction.toUpperCase()} @ $${price.toFixed(price > 10 ? 2 : 4)} (Confidence: ${Math.round(confidence * 100)}% - Filtered Out)`;
       addLog('info', sourceTag, logMsg);
 
-      // Auto Execute Trade if signal passed filters and Bot is running
       if (passesFilters && botRunning) {
         const activeOpenCount = getActiveOpenTrades().length;
-        if (activeOpenCount >= (settings.max_concurrent_positions || 3)) {
-          addLog(
-            'warning',
-            sourceTag,
-            `[AUTO-TRADE SKIPPED] Maximum concurrent position limit (${settings.max_concurrent_positions}) reached (${activeOpenCount} active positions). ${sym} auto-trade skipped.`
-          );
+        if (activeOpenCount < settings.max_concurrent_trades) {
+          addLog('info', 'bot', `[AUTO-EXECUTE] Found valid ${sym} ${direction.toUpperCase()} setup. Initiating trade...`);
+          await executeTrade(newSig);
+          autoTradesExecuted++;
         } else {
-          if (liveModeActive) {
-            if (liveCredentials && liveCredentials.apiKey) {
-              try {
-                const orderRes = await placeLiveOrder(liveCredentials, {
-                  symbol: sym,
-                  direction,
-                  price,
-                  leverage: settings.leverage || 5,
-                  presetStopLossPrice: structTPSL.stop_loss,
-                  tp_legs: structTPSL.tp_legs,
-                });
-                if (orderRes.error) {
-                  addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${orderRes.error}`);
-                } else {
-                  let logSuffix = '';
-                  if (orderRes.tpError) {
-                    addLog('warning', 'bitget_live_auto', `[TP SET FAILED] ${sym}: ${orderRes.tpError}`);
-                    logSuffix += ' (TP FAILED)';
-                  }
-                  if (orderRes.slError) {
-                    addLog('warning', 'bitget_live_auto', `[SL SET FAILED] ${sym}: ${orderRes.slError}`);
-                    logSuffix += ' (SL FAILED)';
-                  }
-                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})${logSuffix}`);
-                  autoTradesExecuted++;
-                }
-              } catch (e: any) {
-                addLog('error', 'bitget_live_auto', `Bitget order exception: ${e.message}`);
-              }
-            }
-          } else {
-            // Demo Mode Auto Trade
-            const demoTrades = getActiveOpenTrades();
-            const alreadyOpen = demoTrades.some((tr) => tr.symbol === sym);
-            if (!alreadyOpen) {
-              demoTrades.unshift({
-                id: Date.now(),
-                symbol: sym,
-                direction,
-                entry_price: price,
-                current_price: price,
-                stop_loss: structTPSL.stop_loss,
-                position_size: settings.risk_per_trade_pct || 1.0,
-                leverage: settings.leverage || 5,
-                confidence,
-                sl_reason: structTPSL.sl_reason,
-                breakeven_applied: 0,
-                dry_run: true,
-                tp_legs: structTPSL.tp_legs,
-              });
-              autoTradesExecuted++;
-              addLog('info', 'demo_auto_trade', `[DEMO AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} @ $${price} (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
-            }
-          }
+          addLog('warning', 'bot', `[MAX TRADES REACHED] Signal for ${sym} valid but skipped (Active: ${activeOpenCount}/${settings.max_concurrent_trades})`);
         }
       }
     }
 
-    // Short 3-second delay between each coin scan to ensure thorough sequential chart analysis
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   }
-
-  return { success: true, new_signals: newSignalsCreated, auto_trades: autoTradesExecuted };
 }
 
-app.post('/api/bot/scan', async (req: Request, res: Response) => {
-  const result = await scanCoinsAndGenerateSignals();
-  res.json({
-    scanned: true,
-    result,
-    symbols: settings.symbols,
-    signal_count: recentSignals.length,
-    timestamp: Math.floor(Date.now() / 1000),
-  });
-});
-
-// Fallback for unmatched API routes to ensure JSON 404 instead of HTML
-app.all('/api/*', (req: Request, res: Response) => {
-  res.status(404).json({ error: `API route not found: ${req.originalUrl}` });
-});
 
 // Background Bot Loop
 setInterval(async () => {
@@ -1167,13 +1158,13 @@ setInterval(async () => {
       if (tp1Hit && t.breakeven_applied !== 1 && !tp3Hit && !slHit) {
         t.breakeven_applied = 1;
         t.stop_loss = t.entry_price;
-        t.sl_reason = `Breakeven Protection (SL @ Entry: $${t.entry_price})`;
+        t.sl_reason = `Breakeven Protection (SL @ Entry: ${t.entry_price})`;
         if (t.tp_legs && t.tp_legs[0]) t.tp_legs[0].hit = 1;
-
+        
         addLog(
           'info',
           'demo_breakeven',
-          `[DEMO BREAKEVEN APPLIED] ${t.symbol} ${t.direction.toUpperCase()} TP1 hit ($${tp1}). Stop Loss automatically transferred to Entry Price ($${t.entry_price})! Risk is now $0.`
+          `[DEMO BREAKEVEN APPLIED] ${t.symbol} ${t.direction.toUpperCase()} TP1 hit (${tp1}). Stop Loss automatically transferred to Entry Price (${t.entry_price})! Risk is now $0.`
         );
       }
 
@@ -1188,7 +1179,7 @@ setInterval(async () => {
           entry_price: t.entry_price,
           close_price: sl,
           realized_pnl: pnl,
-          close_reason: isBe ? `Breakeven Exit @ Entry ($${t.entry_price})` : `Stop Loss Hit @ $${sl}`,
+          close_reason: isBe ? `Breakeven Exit @ Entry (${t.entry_price})` : `Stop Loss Hit @ ${sl}`,
           closed_at: Math.floor(Date.now() / 1000),
           dry_run: true,
         });
@@ -1196,7 +1187,7 @@ setInterval(async () => {
         addLog(
           isBe ? 'info' : 'warning',
           'demo_bot',
-          `[DEMO ${isBe ? 'BREAKEVEN CLOSED' : 'STOP-LOSS HIT'}] ${t.symbol} ${t.direction.toUpperCase()} closed @ $${sl} (PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)})`
+          `[DEMO ${isBe ? 'BREAKEVEN CLOSED' : 'STOP-LOSS HIT'}] ${t.symbol} ${t.direction.toUpperCase()} closed @ ${sl} (PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)})`
         );
       } else if (tp3Hit) {
         const rawPnl = isLong ? (tp3 - t.entry_price) * size : (t.entry_price - tp3) * size;
@@ -1208,7 +1199,7 @@ setInterval(async () => {
           entry_price: t.entry_price,
           close_price: tp3,
           realized_pnl: pnl,
-          close_reason: `Full Take Profit 3 Target Reached @ $${tp3}`,
+          close_reason: `Full Take Profit 3 Target Reached @ ${tp3}`,
           closed_at: Math.floor(Date.now() / 1000),
           dry_run: true,
         });
@@ -1216,7 +1207,7 @@ setInterval(async () => {
         addLog(
           'info',
           'demo_bot',
-          `[DEMO FULL TP3 HIT] ${t.symbol} ${t.direction.toUpperCase()} closed @ $${tp3} (PnL: +$${pnl.toFixed(2)})`
+          `[DEMO FULL TP3 HIT] ${t.symbol} ${t.direction.toUpperCase()} closed @ ${tp3} (PnL: +${pnl.toFixed(2)})`
         );
       }
     });
@@ -1238,16 +1229,16 @@ setInterval(async () => {
           const tp1Hit = tp1 > 0 && (isLong ? t.current_price >= tp1 : t.current_price <= tp1);
 
           // Only trigger breakeven transfer ONCE when TP1 is genuinely hit and not yet processed
-          if (tp1Hit && !processedLiveBreakevenSet.has(t.symbol)) {
+          if (tp1Hit && !processedLiveBreakevenSet.has(t.symbol) && t.breakeven_applied !== 1) {
             processedLiveBreakevenSet.add(t.symbol);
             t.breakeven_applied = 1;
             t.stop_loss = t.entry_price;
-            t.sl_reason = `Breakeven Protection (Bitget SL @ Entry: $${t.entry_price})`;
+            t.sl_reason = `Breakeven Protection (Bitget SL @ Entry: ${t.entry_price})`;
 
             addLog(
               'info',
               'bitget_live_breakeven',
-              `[BITGET LIVE BREAKEVEN] ${t.symbol} TP1 reached ($${tp1}). Transferring Stop Loss to Entry Price ($${t.entry_price}) on Bitget...`
+              `[BITGET LIVE BREAKEVEN] ${t.symbol} TP1 reached (${tp1}). Transferring Stop Loss to Entry Price (${t.entry_price}) on Bitget...`
             );
 
             // Send Stop Loss update to Bitget Exchange (cancels old SL plan orders first)
@@ -1255,7 +1246,7 @@ setInterval(async () => {
               if (slRes.error) {
                 addLog('error', 'bitget_live_breakeven', `Failed to transfer SL to Entry on Bitget for ${t.symbol}: ${slRes.error}`);
               } else {
-                addLog('info', 'bitget_live_breakeven', `[BITGET CONFIRMED] Stop Loss moved to Entry ($${t.entry_price}) for ${t.symbol} on Bitget exchange.`);
+                addLog('info', 'bitget_live_breakeven', `[BITGET CONFIRMED] Stop Loss moved to Entry (${t.entry_price}) for ${t.symbol} on Bitget exchange.`);
               }
             });
           }
@@ -1281,6 +1272,7 @@ setInterval(async () => {
     addLog('error', 'bot_scanner', `Error scanning coins: ${err.message || String(err)}`);
   }
 }, 10000);
+
 
 // ---------------- Vite Middleware / Production Server ----------------
 

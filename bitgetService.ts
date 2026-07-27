@@ -514,6 +514,24 @@ export function getStandardContractSize(symbol: string, price?: number, requeste
   return '1';
 }
 
+export function calculateRiskBasedSize(symbol: string, entryPrice: number, stopLoss: number, riskAmountUsd: number): string {
+  const distance = Math.abs(entryPrice - stopLoss);
+  if (distance === 0 || isNaN(distance)) return getStandardContractSize(symbol, entryPrice);
+  
+  const rawSize = riskAmountUsd / distance;
+  
+  const minSizeStr = getStandardContractSize(symbol, entryPrice);
+  const minSizeNum = parseFloat(minSizeStr);
+  const dotIndex = minSizeStr.indexOf('.');
+  const decimals = dotIndex === -1 ? 0 : minSizeStr.length - dotIndex - 1;
+  
+  let formattedSize = rawSize.toFixed(decimals);
+  if (parseFloat(formattedSize) < minSizeNum) {
+    formattedSize = minSizeStr;
+  }
+  return formattedSize;
+}
+
 export function formatPriceForBitget(symbol: string, price: number): string {
   if (!price || isNaN(price)) return '';
   const sym = symbol.toUpperCase().replace('USDT', '');
@@ -597,7 +615,7 @@ export async function placeLiveOrder(
     const side = params.direction === 'long' ? 'buy' : 'sell';
     const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
 
-    const buildPayload = (tSide?: string, includeTPSL = true) => {
+    const buildPayload = (tSide?: string) => {
       const payload: Record<string, any> = {
         productType: 'USDT-FUTURES',
         symbol: params.symbol,
@@ -611,58 +629,34 @@ export async function placeLiveOrder(
       if (tSide) {
         payload.tradeSide = tSide;
       }
-
-      if (includeTPSL) {
-        if (params.presetStopLossPrice) {
-          const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
-          if (!isNaN(numSL) && numSL > 0) {
-            payload.presetStopLossPrice = formatPriceForBitget(params.symbol, numSL);
-          }
+      
+      if (params.presetStopLossPrice) {
+        const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
+        if (!isNaN(numSL) && numSL > 0) {
+          payload.presetStopLossPrice = formatPriceForBitget(params.symbol, numSL);
         }
-        // Only set presetTakeProfitPrice if no multiple tp_legs are provided
-        if (!params.tp_legs || params.tp_legs.length === 0) {
-          if (params.presetTakeProfitPrice) {
-            const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
-            if (!isNaN(numTP) && numTP > 0) {
-              payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
-            }
+      }
+      // If we don't have multiple TP legs, we can also preset the TP directly on the position
+      if (!params.tp_legs || params.tp_legs.length === 0) {
+        if (params.presetTakeProfitPrice) {
+          const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
+          if (!isNaN(numTP) && numTP > 0) {
+            payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
           }
         }
       }
+      
       return payload;
     };
 
-    let presetSLWasSet = false;
-
-    // Attempt 1: Hedge Mode ('open') + TP/SL
-    let payload = buildPayload('open', true);
+    // Attempt 1: Hedge Mode ('open')
+    let payload = buildPayload('open');
     let res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-    if (res.code === '00000') {
-      presetSLWasSet = !!payload.presetStopLossPrice;
-    }
 
-    // Attempt 2: One-Way Mode (omit tradeSide) + TP/SL if attempt 1 returned mode/side mismatch error
+    // Attempt 2: One-Way Mode (omit tradeSide) if attempt 1 returned mode/side mismatch error
     if (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side mismatch') || res.msg.toLowerCase().includes('unilateral')))) {
-      payload = buildPayload(undefined, true);
+      payload = buildPayload(undefined);
       res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-      if (res.code === '00000') {
-        presetSLWasSet = !!payload.presetStopLossPrice;
-      }
-    }
-
-    // Attempt 3: If tick size / price precision error (e.g. 45115), retry without preset TP/SL as fallback
-    if (res.code === '45115' || (res.msg && (res.msg.includes('multiple') || res.msg.includes('preset')))) {
-      payload = buildPayload('open', false);
-      res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-      if (res.code === '00000') {
-        presetSLWasSet = false;
-      } else {
-        payload = buildPayload(undefined, false);
-        res = await bitgetApiRequest('/api/v2/mix/order/place-order', 'POST', payload, creds);
-        if (res.code === '00000') {
-          presetSLWasSet = false;
-        }
-      }
     }
 
     if (res.code !== '00000') {
@@ -673,9 +667,29 @@ export async function placeLiveOrder(
 
     let tpError = null;
     let slError = null;
-    
-    // Attach explicit TP plan orders. If tp_legs is specified, we place all of them with proper fractional size formatting.
+
+    // Attach explicit SL plan order
+    if (params.presetStopLossPrice) {
+      const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
+      if (!isNaN(numSL) && numSL > 0) {
+        // Wait a tiny bit to ensure position is open
+        await new Promise(r => setTimeout(r, 500));
+        const slRes = await placeLiveTPSL(creds, {
+          symbol: params.symbol,
+          holdSide: params.direction,
+          planType: 'loss_plan',
+          triggerPrice: numSL,
+          size: sizeToUse,
+        });
+        if (slRes.error) slError = slRes.error;
+      }
+    }
+
+    // Attach explicit TP plan orders.
     if (params.tp_legs && params.tp_legs.length > 0) {
+      // Wait for the market order to fill before setting partial TPs
+      await new Promise(r => setTimeout(r, 1500));
+      
       const numTotalSize = parseFloat(sizeToUse);
       const dotIndex = sizeToUse.indexOf('.');
       const precision = dotIndex === -1 ? 0 : sizeToUse.length - dotIndex - 1;
@@ -704,13 +718,26 @@ export async function placeLiveOrder(
         const leg = params.tp_legs[i];
         const legSizeStr = legSizes[i];
         if (parseFloat(legSizeStr) > 0) {
-          const tpRes = await placeLiveTPSL(creds, {
+          let tpRes = await placeLiveTPSL(creds, {
             symbol: params.symbol,
             holdSide: params.direction,
             planType: 'profit_plan',
             triggerPrice: leg.price,
             size: legSizeStr,
           });
+          
+          // Retry once if there was an error (e.g., position not yet recognized)
+          if (tpRes.error) {
+             await new Promise(r => setTimeout(r, 1500));
+             tpRes = await placeLiveTPSL(creds, {
+               symbol: params.symbol,
+               holdSide: params.direction,
+               planType: 'profit_plan',
+               triggerPrice: leg.price,
+               size: legSizeStr,
+             });
+          }
+          
           if (tpRes.error) {
             tpResults.push({ success: false, error: tpRes.error, price: leg.price });
           } else {
@@ -722,33 +749,6 @@ export async function placeLiveOrder(
         tpError = tpResults.filter(r => !r.success).map(r => `${r.price}: ${r.error}`).join('; ') || null;
       } else if (tpResults.length > 0) {
         tpError = tpResults.map(r => `${r.price}: ${r.error}`).join('; ');
-      }
-    } else if (params.presetTakeProfitPrice) {
-      const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
-      if (!isNaN(numTP) && numTP > 0) {
-        const tpRes = await placeLiveTPSL(creds, {
-          symbol: params.symbol,
-          holdSide: params.direction,
-          planType: 'profit_plan',
-          triggerPrice: numTP,
-          size: sizeToUse,
-        });
-        if (tpRes.error) tpError = tpRes.error;
-      }
-    }
-
-    // Attach explicit SL plan order ONLY if it wasn't successfully set on the initial order
-    if (params.presetStopLossPrice && !presetSLWasSet) {
-      const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
-      if (!isNaN(numSL) && numSL > 0) {
-        const slRes = await placeLiveTPSL(creds, {
-          symbol: params.symbol,
-          holdSide: params.direction,
-          planType: 'loss_plan',
-          triggerPrice: numSL,
-          size: sizeToUse,
-        });
-        if (slRes.error) slError = slRes.error;
       }
     }
 
@@ -834,6 +834,7 @@ export async function cancelLivePlanOrders(
       'POST',
       {
         productType: 'USDT-FUTURES',
+        marginCoin: 'USDT',
         symbol: symbol,
         planType: planType,
       },
@@ -881,6 +882,7 @@ export async function closeLivePosition(creds: BitgetCredentials, symbol: string
       'POST',
       {
         productType: 'USDT-FUTURES',
+        marginCoin: 'USDT',
         symbol: symbol,
       },
       creds
