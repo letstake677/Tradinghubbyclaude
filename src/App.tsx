@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Play, Square, RefreshCw, AlertCircle, ShieldCheck, Zap, Activity, TrendingUp, TrendingDown, Lock, CheckCircle2, XCircle } from 'lucide-react';
-import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from 'recharts';
+import { AreaChart, Area, ComposedChart, Bar, Line, ResponsiveContainer, XAxis, YAxis, Tooltip, ReferenceLine } from 'recharts';
 
 const C = {
   bg: '#12151C',
@@ -901,6 +901,18 @@ export default function KehloDashboard() {
   const [maxDailyLoss, setMaxDailyLoss] = useState(5.0);
   const [symbolsText, setSymbolsText] = useState('BTCUSDT, ETHUSDT, SOLUSDT, DOGEUSDT');
   const [timeframe, setTimeframe] = useState('15m');
+
+  const handleTimeframeChange = async (newTf: string) => {
+    setTimeframe(newTf);
+    try {
+      await apiPost(apiBase, '/api/settings', { timeframe: newTf });
+      status.refetch().catch(() => {});
+      signalsQ.refetch().catch(() => {});
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const [dryRun, setDryRun] = useState(true);
   const [leverage, setLeverage] = useState(5);
   const [sessionFilter, setSessionFilter] = useState(true);
@@ -1034,7 +1046,9 @@ export default function KehloDashboard() {
   const hasErrorLogs = (logsQ.data || []).some((l: any) => l.level === 'error');
   const activeStrat = status.data?.active_strategy || 'smc';
 
+  
   const TABS = activeStrat === 'quant_math' ? [
+    { id: 'chart', label: '📈 K-Line Chart', count: null },
     { id: 'quant_hunter', label: '🧮 Quant Tape Hunter', count: null },
     { id: 'positions', label: 'Positions', count: openTrades.data?.length },
     { id: 'signals', label: 'Signals', count: null },
@@ -1043,6 +1057,7 @@ export default function KehloDashboard() {
     { id: 'connect', label: 'Connect', count: null, alert: false },
     { id: 'settings', label: 'Settings', count: null },
   ] : [
+    { id: 'chart', label: '📈 K-Line Chart', count: null },
     { id: 'positions', label: 'Positions', count: openTrades.data?.length },
     { id: 'signals', label: 'Signals', count: null },
     { id: 'history', label: 'History', count: null },
@@ -1195,6 +1210,16 @@ export default function KehloDashboard() {
       </div>
 
       <div className="p-5">
+        
+        {activeTab === 'chart' && (
+          <LiveChart
+            apiBase={apiBase}
+            currentTimeframe={timeframe}
+            onTimeframeChange={handleTimeframeChange}
+            onExecuteTrade={handleExecuteTrade}
+          />
+        )}
+
         {activeTab === 'quant_hunter' && (
           <QuantDashboard quantMetrics={quantMetricsQ.data} />
         )}
@@ -1353,7 +1378,7 @@ export default function KehloDashboard() {
 
                 <div className="mb-3">
                   <label className="text-xs block mb-1 font-medium" style={{ color: C.muted }}>Execution Timeframe</label>
-                  <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)}
+                  <select value={timeframe} onChange={(e) => handleTimeframeChange(e.target.value)}
                     className="w-full px-2.5 py-1.5 rounded text-sm font-mono-data outline-none"
                     style={{ background: C.bg, border: `1px solid ${C.hairline}`, color: C.paper }}>
                     {['1m', '5m', '15m', '30m', '1H', '4H', '1D'].map((tf) => <option key={tf} value={tf}>{tf}</option>)}

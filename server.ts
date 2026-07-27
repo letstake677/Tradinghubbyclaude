@@ -30,6 +30,21 @@ let liveModeActive = false;
 let activeStrategy: 'smc' | 'quant_math' = 'smc';
 const processedLiveBreakevenSet = new Set<string>();
 
+
+function normalizeGranularity(tf: string): string {
+  if (!tf) return '15m';
+  const u = tf.trim().toUpperCase();
+  if (u === '1M' || u === '1MIN') return '1m';
+  if (u === '5M' || u === '5MIN') return '5m';
+  if (u === '15M' || u === '15MIN') return '15m';
+  if (u === '30M' || u === '30MIN') return '30m';
+  if (u === '1H' || u === '1HOUR' || u === '60M') return '1H';
+  if (u === '4H' || u === '4HOUR') return '4H';
+  if (u === '1D' || u === '1DAY' || u === '24H') return '1D';
+  if (u === '1W' || u === '1WEEK') return '1W';
+  return tf;
+}
+
 let settings = {
   risk_per_trade_pct: 1.0,
   max_concurrent_positions: 3,
@@ -369,6 +384,21 @@ app.post('/api/bot/stop', (req: Request, res: Response) => {
   res.json({ bot_running: false });
 });
 
+
+app.get('/api/klines', async (req: Request, res: Response) => {
+  const symbol = String(req.query.symbol || 'BTCUSDT').toUpperCase();
+  const tf = String(req.query.timeframe || settings.timeframe || '15m');
+  const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || '50'))));
+  const gran = normalizeGranularity(tf);
+
+  const klines = await fetchKlines(symbol, gran, limit);
+  if (!klines) {
+    return res.status(500).json({ error: 'Failed to fetch K-lines from Bitget' });
+  }
+
+  res.json({ symbol, timeframe: gran, klines });
+});
+
 app.post('/api/settings', (req: Request, res: Response) => {
   const body = req.body || {};
   if (body.risk_per_trade_pct !== undefined) settings.risk_per_trade_pct = Number(body.risk_per_trade_pct);
@@ -668,38 +698,34 @@ function computeStructuralTPSL(
   }
 }
 
-app.post('/api/trades/execute', async (req: Request, res: Response) => {
-  const { symbol, direction, price, signal_id } = req.body || {};
-  if (!symbol || !direction) {
-    return res.status(400).json({ error: 'Symbol and direction are required' });
-  }
 
+async function executeTrade(sig: any) {
   const currentOpenCount = getActiveOpenTrades().length;
-  if (currentOpenCount >= (settings.max_concurrent_positions || 3)) {
-    const errorMsg = `Maximum limit of ${settings.max_concurrent_positions} concurrent positions reached as configured in Settings (${currentOpenCount} currently open). Close an open trade first.`;
+  const maxPositions = settings.max_concurrent_positions || 3;
+  if (currentOpenCount >= maxPositions) {
+    const errorMsg = `Maximum limit of ${maxPositions} concurrent positions reached (${currentOpenCount} currently open). Close an open trade first.`;
     addLog('warning', 'trade_execution', `[EXECUTION BLOCKED] ${errorMsg}`);
-    return res.status(400).json({ error: errorMsg });
+    return { error: errorMsg };
   }
 
-  const sym = String(symbol).replace(/[\/\-\s]/g, '').toUpperCase();
-  const dir = String(direction).toLowerCase() === 'short' ? 'short' : 'long';
-  const execPrice = parseFloat(price || '0');
+  const sym = String(sig.symbol || 'BTCUSDT').replace(/[\/\-\s]/g, '').toUpperCase();
+  const dir = String(sig.direction || 'long').toLowerCase() === 'short' ? 'short' : 'long';
+  const execPrice = parseFloat(sig.price || '0');
+  const entryP = execPrice > 0 ? execPrice : 100;
 
-  // Mark signal as taken if signal_id provided
-  let sig = signal_id ? recentSignals.find((s) => s.id === signal_id || String(s.id) === String(signal_id)) : null;
-  if (sig) sig.taken = 1;
-
-  const entryP = execPrice > 0 ? execPrice : (sig?.price || 100);
-  const high24 = sig?.high24 || 0;
-  const low24 = sig?.low24 || 0;
+  const high24 = sig.high24 || 0;
+  const low24 = sig.low24 || 0;
 
   const structTPSL = (sig && sig.stop_loss && sig.tp_legs)
     ? { stop_loss: sig.stop_loss, sl_reason: sig.sl_reason, tp_legs: sig.tp_legs }
     : computeStructuralTPSL(dir, entryP, high24, low24);
 
+  sig.taken = 1;
+
   if (liveModeActive) {
     if (!liveCredentials || !liveCredentials.apiKey) {
-      return res.status(400).json({ error: 'Bitget Live API credentials are not configured.' });
+      addLog('error', 'bitget_live_execution', 'Bitget Live API credentials are not configured.');
+      return { error: 'Bitget Live API credentials are not configured.' };
     }
 
     let calculatedSizeStr: string | undefined = undefined;
@@ -724,7 +750,7 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
 
     if (orderRes.error) {
       addLog('error', 'bitget_live_execution', `Failed to execute live order for ${sym}: ${orderRes.error}`);
-      return res.status(400).json({ error: orderRes.error });
+      return { error: orderRes.error };
     }
 
     let logSuffix = '';
@@ -739,17 +765,16 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
 
     addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})${logSuffix}`);
     
-    // Refresh live open positions immediately
     const updatedPos = await fetchLiveOpenPositions(liveCredentials);
     if (updatedPos.positions) liveOpenTrades = updatedPos.positions;
 
-    return res.json({ success: true, mode: 'live', symbol: sym, direction: dir, data: orderRes.data });
+    return { success: true, mode: 'live', symbol: sym, direction: dir, data: orderRes.data };
   }
 
-  // Demo mode trade execution
+  // Demo / Dry Run mode
   const demoTrades = getActiveOpenTrades();
   const newTrade = {
-    id: Date.now(),
+    id: Date.now() + Math.random(),
     symbol: sym,
     direction: dir as 'long' | 'short',
     entry_price: entryP,
@@ -757,7 +782,7 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
     stop_loss: structTPSL.stop_loss,
     position_size: settings.risk_per_trade_pct || 1.0,
     leverage: settings.leverage || 5,
-    confidence: sig?.confidence || 0.88,
+    confidence: sig.confidence || 0.88,
     sl_reason: structTPSL.sl_reason,
     breakeven_applied: 0,
     dry_run: true,
@@ -765,9 +790,29 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
   };
 
   demoTrades.unshift(newTrade);
-  addLog('info', 'api', `[DEMO EXECUTED] New position opened for ${sym} ${dir.toUpperCase()} @ $${entryP} (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
-  return res.json({ success: true, mode: 'dry_run', trade: newTrade });
+  addLog('info', 'bot', `[AUTO-EXECUTED DEMO TRADE] New position opened for ${sym} ${dir.toUpperCase()} @ $${entryP} (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
+  return { success: true, mode: 'dry_run', trade: newTrade };
+}
+
+app.post('/api/trades/execute', async (req: Request, res: Response) => {
+  const { symbol, direction, price, signal_id } = req.body || {};
+  if (!symbol || !direction) {
+    return res.status(400).json({ error: 'Symbol and direction are required' });
+  }
+
+  let sig = signal_id ? recentSignals.find((s) => s.id === signal_id || String(s.id) === String(signal_id)) : null;
+  if (!sig) {
+    sig = { symbol, direction, price, id: signal_id };
+  }
+
+  const result = await executeTrade(sig);
+  if (result.error) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json(result);
 });
+
 
 app.get('/api/trades/history', async (req: Request, res: Response) => {
   if (liveModeActive) {
@@ -906,9 +951,11 @@ setInterval(() => {
   }
 }, 15000);
 
+
 async function fetchKlines(symbol: string, granularity: string, limit = 30) {
   try {
-    const res = await fetch(`https://api.bitget.com/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${granularity}&limit=${limit}`);
+    const gran = normalizeGranularity(granularity);
+    const res = await fetch(`https://api.bitget.com/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${gran}&limit=${limit}`);
     const json = await res.json();
     if (json.code === '00000' && Array.isArray(json.data)) {
       const sorted = json.data.map((c: string[]) => ({
@@ -1103,12 +1150,13 @@ async function scanCoinsAndGenerateSignals() {
 
       if (passesFilters && botRunning) {
         const activeOpenCount = getActiveOpenTrades().length;
-        if (activeOpenCount < settings.max_concurrent_trades) {
+        const maxPositions = settings.max_concurrent_positions || 3;
+        if (activeOpenCount < maxPositions) {
           addLog('info', 'bot', `[AUTO-EXECUTE] Found valid ${sym} ${direction.toUpperCase()} setup. Initiating trade...`);
           await executeTrade(newSig);
           autoTradesExecuted++;
         } else {
-          addLog('warning', 'bot', `[MAX TRADES REACHED] Signal for ${sym} valid but skipped (Active: ${activeOpenCount}/${settings.max_concurrent_trades})`);
+          addLog('warning', 'bot', `[MAX TRADES REACHED] Signal for ${sym} valid but skipped (Active: ${activeOpenCount}/${maxPositions})`);
         }
       }
     }
