@@ -586,6 +586,7 @@ export async function placeLiveOrder(
           holdSide: params.direction,
           planType: 'profit_plan',
           triggerPrice: numTP,
+          size: sizeToUse,
         });
         if (tpRes.error) tpError = tpRes.error;
       }
@@ -598,6 +599,7 @@ export async function placeLiveOrder(
           holdSide: params.direction,
           planType: 'loss_plan',
           triggerPrice: numSL,
+          size: sizeToUse,
         });
         if (slRes.error) slError = slRes.error;
       }
@@ -616,12 +618,38 @@ export async function placeLiveTPSL(
     holdSide: 'long' | 'short';
     planType: 'profit_plan' | 'loss_plan';
     triggerPrice: number;
+    size?: string;
   }
 ) {
   try {
     const formattedPrice = formatPriceForBitget(params.symbol, params.triggerPrice);
+
+    // Auto-detect size if not provided
+    let sizeToUse = params.size;
+    if (!sizeToUse) {
+      const posRes = await bitgetApiRequest(
+        '/api/v2/mix/position/all-position?productType=USDT-FUTURES',
+        'GET',
+        null,
+        creds
+      );
+      if (posRes && posRes.code === '00000' && Array.isArray(posRes.data)) {
+        const matchingPos = posRes.data.find(
+          (p: any) =>
+            p.symbol === params.symbol &&
+            (p.holdSide || '').toLowerCase() === params.holdSide.toLowerCase()
+        );
+        if (matchingPos) {
+          sizeToUse = matchingPos.total || matchingPos.holdAmount || matchingPos.available || '0.1';
+        }
+      }
+      if (!sizeToUse) {
+        sizeToUse = '0.1'; // safe fallback
+      }
+    }
+
     const res = await bitgetApiRequest(
-      '/api/v2/mix/order/place-tpsl',
+      '/api/v2/mix/order/place-tpsl-order',
       'POST',
       {
         productType: 'USDT-FUTURES',
@@ -631,6 +659,7 @@ export async function placeLiveTPSL(
         triggerPrice: formattedPrice,
         triggerType: 'mark_price',
         holdSide: params.holdSide,
+        size: sizeToUse,
       },
       creds
     );
