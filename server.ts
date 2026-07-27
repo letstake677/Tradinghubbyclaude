@@ -877,24 +877,35 @@ app.get('/api/account/balance', async (req: Request, res: Response) => {
   });
 });
 
+// 15-second heartbeat log to confirm bot is active
+setInterval(() => {
+  if (botRunning) {
+    addLog('info', 'bot_scanner', '[SCANNER HEARTBEAT] Bot is actively running and scanning coin markets...');
+  }
+}, 15000);
+
 async function scanCoinsAndGenerateSignals() {
   const targetSymbols = settings.symbols && settings.symbols.length > 0 
     ? settings.symbols 
     : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'DOGEUSDT', 'XRPUSDT'];
 
-  const tickerRes = await fetchPublicMarketTickers(targetSymbols);
-  
-  if (tickerRes.error || !tickerRes.tickers) {
-    addLog('warning', 'market_scanner', `Bitget Public Scanner Notice: ${tickerRes.error || 'No tickers returned'}`);
-    return { success: false, error: tickerRes.error };
-  }
+  addLog('info', 'market_scanner', `[SCANNER START] Sequentially analyzing ${targetSymbols.length} configured coins one-by-one...`);
 
-  const tickers = tickerRes.tickers;
   let newSignalsCreated = 0;
   let autoTradesExecuted = 0;
 
-  for (const t of tickers) {
-    const sym = t.symbol;
+  for (const sym of targetSymbols) {
+    if (!botRunning) break;
+
+    const tickerRes = await fetchPublicMarketTickers([sym]);
+    
+    if (tickerRes.error || !tickerRes.tickers || tickerRes.tickers.length === 0) {
+      addLog('warning', 'market_scanner', `Bitget Public Scanner Notice for ${sym}: ${tickerRes.error || 'No ticker returned'}`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
+    }
+
+    const t = tickerRes.tickers[0];
     const price = parseFloat(t.lastPr || '0');
     const high24 = parseFloat(t.high24h || '0');
     const low24 = parseFloat(t.low24h || '0');
@@ -902,7 +913,10 @@ async function scanCoinsAndGenerateSignals() {
     const volM = Math.round((parseFloat(t.usdtVolume || '0') / 1_000_000) * 10) / 10;
     const fundingPct = parseFloat(t.fundingRate || '0') * 100;
 
-    if (!price) continue;
+    if (!price) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
+    }
 
     const range = high24 - low24;
     const posInRange = range > 0 ? (price - low24) / range : 0.5;
@@ -944,7 +958,7 @@ async function scanCoinsAndGenerateSignals() {
       ? `Hawkes intensity: ${(1.1 + (symHash % 8) / 10).toFixed(2)} | Vol: $${volM}M USDT`
       : `Range pos: ${(posInRange * 100).toFixed(0)}% | FVG & OB Structure Intact`;
 
-    addLog('info', sourceTag, `[SCAN COIN] ${sym}: $${price.toFixed(price > 10 ? 2 : 4)} (${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)}% 24h) | Conf: ${Math.round(confidence * 100)}% | ${stratDesc}`);
+    addLog('info', sourceTag, `[SEQUENTIAL SCAN & CHART ANALYSIS] ${sym}: $${price.toFixed(price > 10 ? 2 : 4)} (${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)}% 24h) | Conf: ${Math.round(confidence * 100)}% | ${stratDesc}`);
 
     const recentDuplicate = recentSignals.find(s => s.symbol === sym && (Math.floor(Date.now() / 1000) - s.ts) < 90);
 
@@ -1013,23 +1027,24 @@ async function scanCoinsAndGenerateSignals() {
         } else {
           if (liveModeActive) {
             if (liveCredentials && liveCredentials.apiKey) {
-              placeLiveOrder(liveCredentials, {
-                symbol: sym,
-                direction,
-                price,
-                leverage: settings.leverage || 5,
-                presetStopLossPrice: structTPSL.stop_loss,
-                presetTakeProfitPrice: structTPSL.tp_legs[0].price,
-              })
-                .then((res) => {
-                  if (res.error) {
-                    addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${res.error}`);
-                  } else {
-                    addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
-                    autoTradesExecuted++;
-                  }
-                })
-                .catch((e) => addLog('error', 'bitget_live_auto', `Bitget order exception: ${e.message}`));
+              try {
+                const orderRes = await placeLiveOrder(liveCredentials, {
+                  symbol: sym,
+                  direction,
+                  price,
+                  leverage: settings.leverage || 5,
+                  presetStopLossPrice: structTPSL.stop_loss,
+                  presetTakeProfitPrice: structTPSL.tp_legs[0].price,
+                });
+                if (orderRes.error) {
+                  addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${orderRes.error}`);
+                } else {
+                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
+                  autoTradesExecuted++;
+                }
+              } catch (e: any) {
+                addLog('error', 'bitget_live_auto', `Bitget order exception: ${e.message}`);
+              }
             }
           } else {
             // Demo Mode Auto Trade
@@ -1058,9 +1073,12 @@ async function scanCoinsAndGenerateSignals() {
         }
       }
     }
+
+    // Short 3-second delay between each coin scan to ensure thorough sequential chart analysis
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 
-  return { success: true, tickers, new_signals: newSignalsCreated, auto_trades: autoTradesExecuted };
+  return { success: true, new_signals: newSignalsCreated, auto_trades: autoTradesExecuted };
 }
 
 app.post('/api/bot/scan', async (req: Request, res: Response) => {
