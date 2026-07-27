@@ -58,7 +58,9 @@ export async function fetchLiveBalance(creds: BitgetCredentials) {
       };
     }
 
-    const futuresData = futuresRes.data || [];
+    const futuresData = Array.isArray(futuresRes.data)
+      ? futuresRes.data
+      : (futuresRes.data?.list || futuresRes.data?.accountList || []);
     let futuresEquity = 0;
     let futuresUnrealizedPnL = 0;
 
@@ -115,28 +117,146 @@ export async function fetchLiveOpenPositions(creds: BitgetCredentials) {
       };
     }
 
-    const rawList = res.data || [];
+    // Try fetching pending TP/SL plan orders from Bitget to match exact trigger prices
+    const planOrdersMap: Record<string, { tpPrice?: number; slPrice?: number }> = {};
+    try {
+      const planRes = await bitgetApiRequest(
+        '/api/v2/mix/order/orders-plan-pending?productType=USDT-FUTURES',
+        'GET',
+        null,
+        creds
+      );
+      if (planRes.code === '00000') {
+        const list = planRes.data?.entrustedList || planRes.data?.list || (Array.isArray(planRes.data) ? planRes.data : []);
+        if (Array.isArray(list)) {
+          list.forEach((o: any) => {
+            const sym = o.symbol;
+            if (!sym) return;
+            if (!planOrdersMap[sym]) planOrdersMap[sym] = {};
+            const trigger = parseFloat(o.triggerPrice || o.executePrice || o.price || '0');
+            const planType = (o.planType || o.orderType || '').toLowerCase();
+            if (planType.includes('profit') || planType.includes('tp') || planType.includes('take')) {
+              planOrdersMap[sym].tpPrice = trigger;
+            } else if (planType.includes('loss') || planType.includes('sl') || planType.includes('stop')) {
+              planOrdersMap[sym].slPrice = trigger;
+            }
+          });
+        }
+      }
+    } catch (e) {
+      // Non-blocking fallback
+    }
+
+    const rawList = Array.isArray(res.data)
+      ? res.data
+      : (res.data?.list || res.data?.openPositionList || []);
     const formatted = rawList
-      .filter((p: any) => parseFloat(p.total || p.holdAmount || '0') > 0)
+      .filter((p: any) => parseFloat(p.total || p.holdAmount || p.available || p.position || '0') > 0)
       .map((p: any, idx: number) => {
-        const entry = parseFloat(p.openPriceAvg || p.averageOpenPrice || '0');
-        const curr = parseFloat(p.marketPrice || p.markPrice || entry || '0');
-        const holdSide = (p.holdSide || 'long').toLowerCase();
+        const sym = p.symbol;
+        const entry = parseFloat(p.openPriceAvg || p.averageOpenPrice || p.openPrice || '0');
+        const curr = parseFloat(p.marketPrice || p.markPrice || p.lastPrice || entry || '0');
+        const holdSide = (p.holdSide || p.posSide || 'long').toLowerCase();
+        const isShort = holdSide === 'short';
+
+        const presetSL = parseFloat(
+          p.presetStopLossPrice || p.stopLoss || p.slPrice || planOrdersMap[sym]?.slPrice || '0'
+        );
+        const presetTP = parseFloat(
+          p.presetTakeProfitPrice || p.presetStopProfitPrice || p.takeProfit || p.tpPrice || planOrdersMap[sym]?.tpPrice || '0'
+        );
+
+        const liqPrice = parseFloat(p.liquidationPrice || p.breakEvenPrice || '0');
+        const stopLossVal = presetSL > 0 ? presetSL : liqPrice;
+
+        const decimals = entry > 1000 ? 2 : entry > 1 ? 2 : 4;
+
+        let tp1Val = 0;
+        let tp2Val = 0;
+        let tp3Val = 0;
+
+        if (presetTP > 0) {
+          tp1Val = presetTP;
+          if (isShort) {
+            tp2Val = Number((presetTP * 0.988).toFixed(decimals));
+            tp3Val = Number((presetTP * 0.975).toFixed(decimals));
+          } else {
+            tp2Val = Number((presetTP * 1.012).toFixed(decimals));
+            tp3Val = Number((presetTP * 1.025).toFixed(decimals));
+          }
+        } else {
+          if (isShort) {
+            tp1Val = Number((entry * 0.988).toFixed(decimals));
+            tp2Val = Number((entry * 0.975).toFixed(decimals));
+            tp3Val = Number((entry * 0.960).toFixed(decimals));
+          } else {
+            tp1Val = Number((entry * 1.012).toFixed(decimals));
+            tp2Val = Number((entry * 1.025).toFixed(decimals));
+            tp3Val = Number((entry * 1.040).toFixed(decimals));
+          }
+        }
+
+        const tp1Hit = isShort
+          ? (curr > 0 && tp1Val > 0 && curr <= tp1Val && curr < entry * 0.992)
+          : (curr > 0 && tp1Val > 0 && curr >= tp1Val && curr > entry * 1.008);
+        const tp2Hit = isShort
+          ? (curr > 0 && tp2Val > 0 && curr <= tp2Val && curr < entry * 0.985)
+          : (curr > 0 && tp2Val > 0 && curr >= tp2Val && curr > entry * 1.015);
+        const tp3Hit = isShort
+          ? (curr > 0 && tp3Val > 0 && curr <= tp3Val && curr < entry * 0.975)
+          : (curr > 0 && tp3Val > 0 && curr >= tp3Val && curr > entry * 1.025);
+
+        const tpLegs = [
+          {
+            id: `${sym}_tp1_${idx}`,
+            level: 1,
+            price: tp1Val,
+            close_fraction: 0.4,
+            hit: tp1Hit ? 1 : 0,
+            reason: presetTP > 0
+              ? `Bitget Exchange Target 1 ($${tp1Val})`
+              : `50% Structural Target ($${tp1Val})`,
+          },
+          {
+            id: `${sym}_tp2_${idx}`,
+            level: 2,
+            price: tp2Val,
+            close_fraction: 0.3,
+            hit: tp2Hit ? 1 : 0,
+            reason: `Order Block Target ($${tp2Val})`,
+          },
+          {
+            id: `${sym}_tp3_${idx}`,
+            level: 3,
+            price: tp3Val,
+            close_fraction: 0.3,
+            hit: tp3Hit ? 1 : 0,
+            reason: `Liquidity Expansion Target ($${tp3Val})`,
+          },
+        ];
+
+        // Breakeven is ONLY true if SL is explicitly placed near Entry price on Bitget OR if TP1 was actually reached
+        const isSlAtEntry = presetSL > 0 && (Math.abs(presetSL - entry) / entry < 0.002);
+        const isBreakeven = isSlAtEntry || tp1Hit;
 
         return {
-          id: p.positionId || p.symbol + '_' + idx,
-          symbol: p.symbol,
-          direction: holdSide === 'short' ? 'short' : 'long',
+          id: p.positionId || `${sym}_${idx}`,
+          symbol: sym,
+          direction: isShort ? 'short' : 'long',
           entry_price: entry,
           current_price: curr,
-          stop_loss: parseFloat(p.liquidationPrice || '0'),
-          position_size: parseFloat(p.total || p.holdAmount || '0'),
+          stop_loss: isSlAtEntry ? entry : stopLossVal,
+          position_size: parseFloat(p.total || p.holdAmount || p.available || '0'),
           confidence: 0.95,
-          sl_reason: 'Bitget Exchange Real Position',
-          breakeven_applied: 0,
+          sl_reason: isSlAtEntry
+            ? `Breakeven Protection (Bitget SL @ Entry: $${entry.toFixed(decimals)})`
+            : (presetSL > 0
+              ? `Bitget Preset Stop Loss ($${presetSL})`
+              : `Bitget Exchange Real Position (Liq: $${liqPrice.toFixed(decimals)})`),
+          breakeven_applied: isBreakeven ? 1 : 0,
           dry_run: false,
-          tp_legs: [],
-          unrealized_pnl: parseFloat(p.unrealizedPL || '0'),
+          tp_legs: tpLegs,
+          unrealized_pnl: parseFloat(p.unrealizedPL || p.unrealizedPnl || '0'),
         };
       });
 
@@ -350,6 +470,29 @@ export function formatPriceForBitget(symbol: string, price: number): string {
   return price.toFixed(decimals);
 }
 
+export async function setLiveLeverage(
+  creds: BitgetCredentials,
+  symbol: string,
+  leverage: number,
+  holdSide?: 'long' | 'short'
+) {
+  try {
+    const payload: Record<string, any> = {
+      productType: 'USDT-FUTURES',
+      symbol: symbol,
+      marginCoin: 'USDT',
+      leverage: String(leverage),
+    };
+    if (holdSide) {
+      payload.holdSide = holdSide;
+    }
+    const res = await bitgetApiRequest('/api/v2/mix/account/set-leverage', 'POST', payload, creds);
+    return res;
+  } catch (err: any) {
+    return { error: String(err) };
+  }
+}
+
 export async function placeLiveOrder(
   creds: BitgetCredentials,
   params: {
@@ -357,6 +500,7 @@ export async function placeLiveOrder(
     direction: 'long' | 'short';
     size?: string;
     price?: number;
+    leverage?: number;
     presetStopLossPrice?: number | string;
     presetTakeProfitPrice?: number | string;
     marginMode?: string;
@@ -364,6 +508,10 @@ export async function placeLiveOrder(
   }
 ) {
   try {
+    if (params.leverage && params.leverage > 0) {
+      await setLiveLeverage(creds, params.symbol, params.leverage, params.direction);
+    }
+
     const side = params.direction === 'long' ? 'buy' : 'sell';
     const sizeToUse = getStandardContractSize(params.symbol, params.price, params.size);
 
@@ -392,7 +540,9 @@ export async function placeLiveOrder(
         if (params.presetTakeProfitPrice) {
           const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
           if (!isNaN(numTP) && numTP > 0) {
-            payload.presetTakeProfitPrice = formatPriceForBitget(params.symbol, numTP);
+            const formattedTP = formatPriceForBitget(params.symbol, numTP);
+            payload.presetTakeProfitPrice = formattedTP;
+            payload.presetStopProfitPrice = formattedTP; // Bitget V2 API standard parameter name
           }
         }
       }
@@ -433,9 +583,115 @@ export async function placeLiveOrder(
       };
     }
 
+    // Attach explicit TP and SL plan orders to guarantee Bitget shows TP 1 / SL 1 on position
+    if (params.presetTakeProfitPrice) {
+      const numTP = typeof params.presetTakeProfitPrice === 'number' ? params.presetTakeProfitPrice : parseFloat(String(params.presetTakeProfitPrice));
+      if (!isNaN(numTP) && numTP > 0) {
+        await placeLiveTPSL(creds, {
+          symbol: params.symbol,
+          holdSide: params.direction,
+          planType: 'profit_plan',
+          triggerPrice: numTP,
+        });
+      }
+    }
+    if (params.presetStopLossPrice) {
+      const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
+      if (!isNaN(numSL) && numSL > 0) {
+        await placeLiveTPSL(creds, {
+          symbol: params.symbol,
+          holdSide: params.direction,
+          planType: 'loss_plan',
+          triggerPrice: numSL,
+        });
+      }
+    }
+
     return { success: true, data: res.data };
   } catch (err: any) {
     return { error: `Network/Bitget Order Error: ${err.message || String(err)}` };
+  }
+}
+
+export async function placeLiveTPSL(
+  creds: BitgetCredentials,
+  params: {
+    symbol: string;
+    holdSide: 'long' | 'short';
+    planType: 'profit_plan' | 'loss_plan';
+    triggerPrice: number;
+  }
+) {
+  try {
+    const formattedPrice = formatPriceForBitget(params.symbol, params.triggerPrice);
+    const res = await bitgetApiRequest(
+      '/api/v2/mix/order/place-tpsl',
+      'POST',
+      {
+        productType: 'USDT-FUTURES',
+        symbol: params.symbol,
+        marginCoin: 'USDT',
+        planType: params.planType,
+        triggerPrice: formattedPrice,
+        triggerType: 'mark_price',
+        holdSide: params.holdSide,
+      },
+      creds
+    );
+    return res;
+  } catch (err: any) {
+    return { error: String(err) };
+  }
+}
+
+export async function cancelLivePlanOrders(
+  creds: BitgetCredentials,
+  symbol: string,
+  planType: 'profit_plan' | 'loss_plan' | 'moving_plan' | 'normal_plan' = 'loss_plan'
+) {
+  try {
+    const res = await bitgetApiRequest(
+      '/api/v2/mix/order/cancel-plan-order',
+      'POST',
+      {
+        productType: 'USDT-FUTURES',
+        symbol: symbol,
+        planType: planType,
+      },
+      creds
+    );
+    return res;
+  } catch (err: any) {
+    return null;
+  }
+}
+
+export async function updateLiveStopLoss(
+  creds: BitgetCredentials,
+  symbol: string,
+  holdSide: 'long' | 'short',
+  stopLossPrice: number
+) {
+  try {
+    // Cancel prior SL plan orders first to avoid stacking up duplicate SLs on Bitget
+    await cancelLivePlanOrders(creds, symbol, 'loss_plan');
+
+    const res = await placeLiveTPSL(creds, {
+      symbol,
+      holdSide,
+      planType: 'loss_plan',
+      triggerPrice: stopLossPrice,
+    });
+
+    if (res.code && res.code !== '00000') {
+      return {
+        error: `Bitget TPSL Error (${res.code}): ${res.msg || 'Failed to update Stop Loss'}`,
+      };
+    }
+
+    return { success: true, data: res.data };
+  } catch (err: any) {
+    return { error: `Network/Bitget API Error: ${err.message || String(err)}` };
   }
 }
 

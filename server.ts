@@ -11,6 +11,10 @@ import {
   closeLivePosition,
   fetchPublicMarketTickers,
   placeLiveOrder,
+  setLiveLeverage,
+  updateLiveStopLoss,
+  cancelLivePlanOrders,
+  placeLiveTPSL,
 } from './bitgetService';
 
 const app = express();
@@ -23,6 +27,7 @@ app.use(express.json());
 let botRunning = true;
 let liveModeActive = false;
 let activeStrategy: 'smc' | 'quant_math' = 'smc';
+const processedLiveBreakevenSet = new Set<string>();
 
 let settings = {
   risk_per_trade_pct: 1.0,
@@ -366,13 +371,18 @@ app.post('/api/bot/stop', (req: Request, res: Response) => {
 app.post('/api/settings', (req: Request, res: Response) => {
   const body = req.body || {};
   if (body.risk_per_trade_pct !== undefined) settings.risk_per_trade_pct = Number(body.risk_per_trade_pct);
-  if (body.max_concurrent_positions !== undefined) settings.max_concurrent_positions = Number(body.max_concurrent_positions);
+  if (body.max_concurrent_positions !== undefined) settings.max_concurrent_positions = Math.max(1, Math.round(Number(body.max_concurrent_positions)));
   if (body.max_daily_loss_pct !== undefined) settings.max_daily_loss_pct = Number(body.max_daily_loss_pct);
   if (Array.isArray(body.symbols)) settings.symbols = body.symbols;
   if (body.timeframe) settings.timeframe = body.timeframe;
   if (body.dry_run !== undefined) settings.dry_run = Boolean(body.dry_run);
+  if (body.leverage !== undefined) settings.leverage = Math.max(1, Math.min(125, Math.round(Number(body.leverage))));
+  if (body.session_filter_enabled !== undefined) settings.session_filter_enabled = Boolean(body.session_filter_enabled);
+  if (body.htf_bias_enabled !== undefined) settings.htf_bias_enabled = Boolean(body.htf_bias_enabled);
+  if (body.require_sweep_confirmation !== undefined) settings.require_sweep_confirmation = Boolean(body.require_sweep_confirmation);
+  if (body.displacement_filter_enabled !== undefined) settings.displacement_filter_enabled = Boolean(body.displacement_filter_enabled);
 
-  addLog('info', 'api', 'Settings updated from dashboard');
+  addLog('info', 'api', `Settings updated: Risk=${settings.risk_per_trade_pct}%, MaxPositions=${settings.max_concurrent_positions}, Leverage=${settings.leverage}x, Filters=[Session:${settings.session_filter_enabled}, HTF:${settings.htf_bias_enabled}, Sweep:${settings.require_sweep_confirmation}, Disp:${settings.displacement_filter_enabled}]`);
   res.json({ settings });
 });
 
@@ -441,14 +451,16 @@ app.get('/api/credentials/status', (req: Request, res: Response) => {
 app.get('/api/trades/open', async (req: Request, res: Response) => {
   if (liveModeActive) {
     if (!liveCredentials || !liveCredentials.apiKey) {
+      liveOpenTrades = [];
       return res.json([]);
     }
     const livePos = await fetchLiveOpenPositions(liveCredentials);
     if (livePos.error) {
       addLog('error', 'bitget_live', livePos.error);
-      return res.json([]);
+      return res.json(liveOpenTrades);
     }
-    return res.json(livePos.positions);
+    liveOpenTrades = livePos.positions || [];
+    return res.json(liveOpenTrades);
   }
 
   res.json(getActiveOpenTrades());
@@ -476,35 +488,43 @@ app.post('/api/trades/:id/close', async (req: Request, res: Response) => {
     }
 
     addLog('info', 'bitget_live', `[BITGET LIVE] Manual close request executed for ${symbolToClose} via Bitget API`);
+    // Refresh live open positions after close
+    const refreshPos = await fetchLiveOpenPositions(liveCredentials);
+    if (refreshPos.positions) liveOpenTrades = refreshPos.positions;
+
     return res.json({ closed: true, symbol: symbolToClose, mode: 'live' });
   }
 
-  const tradeId = Number(tradeIdParam);
   const trades = getActiveOpenTrades();
   const history = getActiveTradeHistory();
-  const index = trades.findIndex((t) => t.id === tradeId);
+  const index = trades.findIndex(
+    (t) => String(t.id) === String(tradeIdParam) || t.symbol === tradeIdParam
+  );
   if (index === -1) {
     return res.status(404).json({ error: 'Trade not found or already closed' });
   }
 
   const [trade] = trades.splice(index, 1);
-  const pnl = Math.round((Math.random() * 180 + 30) * 100) / 100;
-  const closePrice = trade.direction === 'long' ? trade.entry_price * 1.012 : trade.entry_price * 0.988;
+  const size = Number(trade.position_size || 1.0);
+  const entry = Number(trade.entry_price || 0);
+  const current = Number(trade.current_price || entry);
+  const rawPnl = trade.direction === 'long' ? (current - entry) * size : (entry - current) * size;
+  const pnl = Math.round(rawPnl * 100) / 100;
 
   history.unshift({
     id: trade.id,
     symbol: trade.symbol,
     direction: trade.direction,
     entry_price: trade.entry_price,
-    close_price: closePrice,
+    close_price: current,
     realized_pnl: pnl,
     close_reason: 'Manual exit via dashboard',
     closed_at: Math.floor(Date.now() / 1000),
     dry_run: true,
   });
 
-  addLog('info', 'api', `[DEMO] [${trade.symbol}] Position #${tradeId} closed @ $${closePrice.toFixed(2)}, PnL +$${pnl}`);
-  res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice, mode: 'dry_run' });
+  addLog('info', 'api', `[DEMO] [${trade.symbol}] Position closed @ $${current.toFixed(current > 10 ? 2 : 4)}, PnL: ${pnl >= 0 ? '+' : ''}$${pnl}`);
+  res.json({ closed: true, trade_id: trade.id, pnl, close_price: current, mode: 'dry_run' });
 });
 
 function computeStructuralTPSL(
@@ -653,6 +673,13 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Symbol and direction are required' });
   }
 
+  const currentOpenCount = getActiveOpenTrades().length;
+  if (currentOpenCount >= (settings.max_concurrent_positions || 3)) {
+    const errorMsg = `Maximum limit of ${settings.max_concurrent_positions} concurrent positions reached as configured in Settings (${currentOpenCount} currently open). Close an open trade first.`;
+    addLog('warning', 'trade_execution', `[EXECUTION BLOCKED] ${errorMsg}`);
+    return res.status(400).json({ error: errorMsg });
+  }
+
   const sym = String(symbol).replace(/[\/\-\s]/g, '').toUpperCase();
   const dir = String(direction).toLowerCase() === 'short' ? 'short' : 'long';
   const execPrice = parseFloat(price || '0');
@@ -678,6 +705,7 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
       symbol: sym,
       direction: dir,
       price: entryP,
+      leverage: settings.leverage || 5,
       presetStopLossPrice: structTPSL.stop_loss,
       presetTakeProfitPrice: structTPSL.tp_legs[0].price,
     });
@@ -687,7 +715,12 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
       return res.status(400).json({ error: orderRes.error });
     }
 
-    addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API (SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
+    addLog('info', 'bitget_live_execution', `[BITGET LIVE EXECUTED] ${sym} ${dir.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
+    
+    // Refresh live open positions immediately
+    const updatedPos = await fetchLiveOpenPositions(liveCredentials);
+    if (updatedPos.positions) liveOpenTrades = updatedPos.positions;
+
     return res.json({ success: true, mode: 'live', symbol: sym, direction: dir, data: orderRes.data });
   }
 
@@ -701,6 +734,7 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
     current_price: entryP,
     stop_loss: structTPSL.stop_loss,
     position_size: settings.risk_per_trade_pct || 1.0,
+    leverage: settings.leverage || 5,
     confidence: sig?.confidence || 0.88,
     sl_reason: structTPSL.sl_reason,
     breakeven_applied: 0,
@@ -709,7 +743,7 @@ app.post('/api/trades/execute', async (req: Request, res: Response) => {
   };
 
   demoTrades.unshift(newTrade);
-  addLog('info', 'api', `[DEMO EXECUTED] New position opened for ${sym} ${dir.toUpperCase()} @ $${entryP} (SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
+  addLog('info', 'api', `[DEMO EXECUTED] New position opened for ${sym} ${dir.toUpperCase()} @ $${entryP} (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
   return res.json({ success: true, mode: 'dry_run', trade: newTrade });
 });
 
@@ -896,9 +930,14 @@ async function scanCoinsAndGenerateSignals() {
     const confidence = Math.min(0.96, Math.max(0.52, Math.round(rawConfidence * 100) / 100));
 
     // Filter validation logic
+    const currentUtcHour = new Date().getUTCHours();
+    const sessionConfirmed = !settings.session_filter_enabled || (currentUtcHour >= 0 && currentUtcHour <= 21);
+    const htfBiasConfirmed = !settings.htf_bias_enabled || (isBullish ? chg24 >= -2.5 : chg24 <= 2.5);
     const sweepConfirmed = !settings.require_sweep_confirmation || (posInRange < 0.38 || posInRange > 0.62);
+    const displacementConfirmed = !settings.displacement_filter_enabled || (Math.abs(chg24) >= 0.5 || volM > 15);
     const minThreshold = 0.72;
-    const passesFilters = confidence >= minThreshold && sweepConfirmed;
+
+    const passesFilters = confidence >= minThreshold && sessionConfirmed && htfBiasConfirmed && sweepConfirmed && displacementConfirmed;
 
     const sourceTag = liveModeActive ? 'bitget_live_scanner' : (activeStrategy === 'quant_math' ? 'quant_math_scanner' : 'smc_scanner');
     const stratDesc = activeStrategy === 'quant_math'
@@ -927,7 +966,10 @@ async function scanCoinsAndGenerateSignals() {
       }
 
       if (!passesFilters) {
+        if (!sessionConfirmed) reasons.push("Filtered: Outside active session trading window (Session Filter active)");
+        if (!htfBiasConfirmed) reasons.push("Filtered: Market structure conflicts with HTF Trend Bias");
         if (!sweepConfirmed) reasons.push(`Filtered: Liquidity sweep incomplete (Mid-range pos ${(posInRange * 100).toFixed(0)}%)`);
+        if (!displacementConfirmed) reasons.push("Filtered: Insufficient price displacement / volume momentum");
         if (confidence < minThreshold) reasons.push(`Filtered: Confidence (${Math.round(confidence * 100)}%) below ${Math.round(minThreshold * 100)}% threshold`);
       }
 
@@ -961,46 +1003,57 @@ async function scanCoinsAndGenerateSignals() {
 
       // Auto Execute Trade if signal passed filters and Bot is running
       if (passesFilters && botRunning) {
-        if (liveModeActive) {
-          if (liveCredentials && liveCredentials.apiKey) {
-            placeLiveOrder(liveCredentials, {
-              symbol: sym,
-              direction,
-              price,
-              presetStopLossPrice: structTPSL.stop_loss,
-              presetTakeProfitPrice: structTPSL.tp_legs[0].price,
-            })
-              .then((res) => {
-                if (res.error) {
-                  addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${res.error}`);
-                } else {
-                  addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
-                  autoTradesExecuted++;
-                }
-              })
-              .catch((e) => addLog('error', 'bitget_live_auto', `Bitget order exception: ${e.message}`));
-          }
+        const activeOpenCount = getActiveOpenTrades().length;
+        if (activeOpenCount >= (settings.max_concurrent_positions || 3)) {
+          addLog(
+            'warning',
+            sourceTag,
+            `[AUTO-TRADE SKIPPED] Maximum concurrent position limit (${settings.max_concurrent_positions}) reached (${activeOpenCount} active positions). ${sym} auto-trade skipped.`
+          );
         } else {
-          // Demo Mode Auto Trade
-          const demoTrades = getActiveOpenTrades();
-          const alreadyOpen = demoTrades.some((tr) => tr.symbol === sym);
-          if (!alreadyOpen && demoTrades.length < (settings.max_concurrent_positions || 5)) {
-            demoTrades.unshift({
-              id: Date.now(),
-              symbol: sym,
-              direction,
-              entry_price: price,
-              current_price: price,
-              stop_loss: structTPSL.stop_loss,
-              position_size: settings.risk_per_trade_pct || 1.0,
-              confidence,
-              sl_reason: structTPSL.sl_reason,
-              breakeven_applied: 0,
-              dry_run: true,
-              tp_legs: structTPSL.tp_legs,
-            });
-            autoTradesExecuted++;
-            addLog('info', 'demo_auto_trade', `[DEMO AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} @ $${price} (SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
+          if (liveModeActive) {
+            if (liveCredentials && liveCredentials.apiKey) {
+              placeLiveOrder(liveCredentials, {
+                symbol: sym,
+                direction,
+                price,
+                leverage: settings.leverage || 5,
+                presetStopLossPrice: structTPSL.stop_loss,
+                presetTakeProfitPrice: structTPSL.tp_legs[0].price,
+              })
+                .then((res) => {
+                  if (res.error) {
+                    addLog('error', 'bitget_live_auto', `Auto-Trade Execution Failed for ${sym}: ${res.error}`);
+                  } else {
+                    addLog('info', 'bitget_live_auto', `[BITGET LIVE AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} Market Order placed via Bitget API (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP: $${structTPSL.tp_legs[0].price})`);
+                    autoTradesExecuted++;
+                  }
+                })
+                .catch((e) => addLog('error', 'bitget_live_auto', `Bitget order exception: ${e.message}`));
+            }
+          } else {
+            // Demo Mode Auto Trade
+            const demoTrades = getActiveOpenTrades();
+            const alreadyOpen = demoTrades.some((tr) => tr.symbol === sym);
+            if (!alreadyOpen) {
+              demoTrades.unshift({
+                id: Date.now(),
+                symbol: sym,
+                direction,
+                entry_price: price,
+                current_price: price,
+                stop_loss: structTPSL.stop_loss,
+                position_size: settings.risk_per_trade_pct || 1.0,
+                leverage: settings.leverage || 5,
+                confidence,
+                sl_reason: structTPSL.sl_reason,
+                breakeven_applied: 0,
+                dry_run: true,
+                tp_legs: structTPSL.tp_legs,
+              });
+              autoTradesExecuted++;
+              addLog('info', 'demo_auto_trade', `[DEMO AUTO-TRADE EXECUTED] ${sym} ${direction.toUpperCase()} @ $${price} (Risk: ${settings.risk_per_trade_pct}%, Leverage: ${settings.leverage}x, SL: $${structTPSL.stop_loss}, TP1: $${structTPSL.tp_legs[0].price})`);
+            }
           }
         }
       }
@@ -1030,13 +1083,140 @@ app.all('/api/*', (req: Request, res: Response) => {
 setInterval(async () => {
   if (!botRunning) return;
 
-  const currentOpen = getActiveOpenTrades();
+  if (!liveModeActive) {
+    // Demo mode: Fluctuate prices and evaluate Stop Loss & Take Profit targets
+    const toCloseIndexes: number[] = [];
+    demoOpenTrades.forEach((t, idx) => {
+      const delta = (Math.random() - 0.47) * (t.entry_price * 0.003);
+      t.current_price = Math.round((t.current_price + delta) * 1000) / 1000;
 
-  // Gently fluctuate current prices of active positions
-  currentOpen.forEach((t) => {
-    const delta = (Math.random() - 0.48) * (t.entry_price * 0.002);
-    t.current_price = Math.round((t.current_price + delta) * 1000) / 1000;
-  });
+      const isLong = t.direction === 'long';
+      const sl = Number(t.stop_loss || 0);
+      const tp1 = t.tp_legs && t.tp_legs.length > 0 ? Number(t.tp_legs[0].price) : 0;
+      const tp3 = t.tp_legs && t.tp_legs.length > 2 ? Number(t.tp_legs[2].price) : (tp1 > 0 ? tp1 * (isLong ? 1.02 : 0.98) : 0);
+      const size = Number(t.position_size || 1.0);
+
+      let slHit = false;
+      let tp1Hit = false;
+      let tp3Hit = false;
+
+      if (sl > 0) {
+        if (isLong && t.current_price <= sl) slHit = true;
+        if (!isLong && t.current_price >= sl) slHit = true;
+      }
+
+      if (tp1 > 0) {
+        if (isLong && t.current_price >= tp1) tp1Hit = true;
+        if (!isLong && t.current_price <= tp1) tp1Hit = true;
+      }
+
+      if (tp3 > 0) {
+        if (isLong && t.current_price >= tp3) tp3Hit = true;
+        if (!isLong && t.current_price <= tp3) tp3Hit = true;
+      }
+
+      // Check Breakeven trigger when TP1 is hit
+      if (tp1Hit && t.breakeven_applied !== 1 && !tp3Hit && !slHit) {
+        t.breakeven_applied = 1;
+        t.stop_loss = t.entry_price;
+        t.sl_reason = `Breakeven Protection (SL @ Entry: $${t.entry_price})`;
+        if (t.tp_legs && t.tp_legs[0]) t.tp_legs[0].hit = 1;
+
+        addLog(
+          'info',
+          'demo_breakeven',
+          `[DEMO BREAKEVEN APPLIED] ${t.symbol} ${t.direction.toUpperCase()} TP1 hit ($${tp1}). Stop Loss automatically transferred to Entry Price ($${t.entry_price})! Risk is now $0.`
+        );
+      }
+
+      if (slHit) {
+        const rawPnl = isLong ? (sl - t.entry_price) * size : (t.entry_price - sl) * size;
+        const pnl = Math.round(rawPnl * 100) / 100;
+        const isBe = t.breakeven_applied === 1 && Math.abs(sl - t.entry_price) < 0.001;
+        demoTradeHistory.unshift({
+          id: t.id,
+          symbol: t.symbol,
+          direction: t.direction,
+          entry_price: t.entry_price,
+          close_price: sl,
+          realized_pnl: pnl,
+          close_reason: isBe ? `Breakeven Exit @ Entry ($${t.entry_price})` : `Stop Loss Hit @ $${sl}`,
+          closed_at: Math.floor(Date.now() / 1000),
+          dry_run: true,
+        });
+        toCloseIndexes.push(idx);
+        addLog(
+          isBe ? 'info' : 'warning',
+          'demo_bot',
+          `[DEMO ${isBe ? 'BREAKEVEN CLOSED' : 'STOP-LOSS HIT'}] ${t.symbol} ${t.direction.toUpperCase()} closed @ $${sl} (PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)})`
+        );
+      } else if (tp3Hit) {
+        const rawPnl = isLong ? (tp3 - t.entry_price) * size : (t.entry_price - tp3) * size;
+        const pnl = Math.round(rawPnl * 100) / 100;
+        demoTradeHistory.unshift({
+          id: t.id,
+          symbol: t.symbol,
+          direction: t.direction,
+          entry_price: t.entry_price,
+          close_price: tp3,
+          realized_pnl: pnl,
+          close_reason: `Full Take Profit 3 Target Reached @ $${tp3}`,
+          closed_at: Math.floor(Date.now() / 1000),
+          dry_run: true,
+        });
+        toCloseIndexes.push(idx);
+        addLog(
+          'info',
+          'demo_bot',
+          `[DEMO FULL TP3 HIT] ${t.symbol} ${t.direction.toUpperCase()} closed @ $${tp3} (PnL: +$${pnl.toFixed(2)})`
+        );
+      }
+    });
+
+    for (let i = toCloseIndexes.length - 1; i >= 0; i--) {
+      demoOpenTrades.splice(toCloseIndexes[i], 1);
+    }
+  } else if (liveCredentials && liveCredentials.apiKey) {
+    // Live mode: Background position sync with Bitget & Automatic Breakeven transfer
+    try {
+      const res = await fetchLiveOpenPositions(liveCredentials);
+      if (res.positions) {
+        liveOpenTrades = res.positions;
+
+        // Check if any live position hit TP1 and needs Breakeven SL update on Bitget
+        for (const t of liveOpenTrades) {
+          const tp1 = t.tp_legs && t.tp_legs.length > 0 ? Number(t.tp_legs[0].price) : 0;
+          const isLong = t.direction === 'long';
+          const tp1Hit = tp1 > 0 && (isLong ? t.current_price >= tp1 : t.current_price <= tp1);
+
+          // Only trigger breakeven transfer ONCE when TP1 is genuinely hit and not yet processed
+          if (tp1Hit && !processedLiveBreakevenSet.has(t.symbol)) {
+            processedLiveBreakevenSet.add(t.symbol);
+            t.breakeven_applied = 1;
+            t.stop_loss = t.entry_price;
+            t.sl_reason = `Breakeven Protection (Bitget SL @ Entry: $${t.entry_price})`;
+
+            addLog(
+              'info',
+              'bitget_live_breakeven',
+              `[BITGET LIVE BREAKEVEN] ${t.symbol} TP1 reached ($${tp1}). Transferring Stop Loss to Entry Price ($${t.entry_price}) on Bitget...`
+            );
+
+            // Send Stop Loss update to Bitget Exchange (cancels old SL plan orders first)
+            updateLiveStopLoss(liveCredentials, t.symbol, t.direction, t.entry_price).then((slRes) => {
+              if (slRes.error) {
+                addLog('error', 'bitget_live_breakeven', `Failed to transfer SL to Entry on Bitget for ${t.symbol}: ${slRes.error}`);
+              } else {
+                addLog('info', 'bitget_live_breakeven', `[BITGET CONFIRMED] Stop Loss moved to Entry ($${t.entry_price}) for ${t.symbol} on Bitget exchange.`);
+              }
+            });
+          }
+        }
+      }
+    } catch (e) {
+      // Sync is non-blocking
+    }
+  }
 
   // Fluctuate Hawkes intensities and quant signals
   if (activeStrategy === 'quant_math') {

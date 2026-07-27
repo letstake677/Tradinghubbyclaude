@@ -212,26 +212,43 @@ function PositionCard({ pos, apiBase, onClose }: { pos: any; apiBase: string; on
       )}
 
       <div className="space-y-1.5 pt-1 border-t" style={{ borderColor: C.hairline }}>
-        <span className="text-[11px] font-medium block mb-1" style={{ color: C.muted }}>Take Profit Targets:</span>
-        {legs.map((tp: any) => (
-          <div key={tp.id} className="flex items-center justify-between text-xs gap-2 flex-wrap">
-            <div className="flex items-center" style={{ color: tp.hit === 1 ? C.long : C.paper }}>
-              <StructureMark color={tp.hit === 1 ? C.long : C.amber} />
-              <span>
-                TP{tp.level} <span className="font-mono-data">${Number(tp.price).toFixed(2)}</span>
-                <span style={{ color: C.muted }}> · {(tp.close_fraction * 100).toFixed(0)}% size</span>
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px]" style={{ color: C.muted }}>{tp.reason}</span>
-              {tp.hit === 1 ? (
-                <span className="text-[10px] px-1.5 py-0.2 rounded font-medium" style={{ background: `${C.long}22`, color: C.long }}>Hit</span>
-              ) : (
-                <span className="text-[10px] px-1.5 py-0.2 rounded" style={{ background: C.panelAlt, color: C.muted }}>Pending</span>
-              )}
-            </div>
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-[11px] font-medium" style={{ color: C.muted }}>Take Profit Targets:</span>
+          {legs.length > 0 && (
+            <span className="text-[10px] font-mono-data" style={{ color: C.amber }}>
+              {legs.filter((l: any) => l.hit === 1).length}/{legs.length} Filled
+            </span>
+          )}
+        </div>
+        {legs.length === 0 ? (
+          <div className="text-xs italic py-1" style={{ color: C.muted }}>
+            Calculating structural TP targets for live position...
           </div>
-        ))}
+        ) : (
+          legs.map((tp: any) => {
+            const tpPrice = Number(tp.price || 0);
+            const formattedPrice = tpPrice > 1000 ? tpPrice.toFixed(2) : tpPrice > 1 ? tpPrice.toFixed(2) : tpPrice.toFixed(4);
+            return (
+              <div key={tp.id} className="flex items-center justify-between text-xs gap-2 flex-wrap py-0.5">
+                <div className="flex items-center" style={{ color: tp.hit === 1 ? C.long : C.paper }}>
+                  <StructureMark color={tp.hit === 1 ? C.long : C.amber} />
+                  <span>
+                    TP{tp.level} <span className="font-mono-data font-semibold">${formattedPrice}</span>
+                    <span style={{ color: C.muted }}> · {(tp.close_fraction * 100).toFixed(0)}% position</span>
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px]" style={{ color: C.muted }}>{tp.reason}</span>
+                  {tp.hit === 1 ? (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded font-semibold border" style={{ background: `${C.long}22`, color: C.long, borderColor: `${C.long}44` }}>✓ Filled</span>
+                  ) : (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded font-medium border" style={{ background: C.panelAlt, color: C.muted, borderColor: C.hairline }}>Pending</span>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
       </div>
     </div>
   );
@@ -816,16 +833,16 @@ export default function KehloDashboard() {
   const [syncing, setSyncing] = useState(false);
   const [scanningNow, setScanningNow] = useState(false);
 
-  const status = usePolling(useCallback(() => apiGet(apiBase, '/api/status'), [apiBase]), 5000);
-  const openTrades = usePolling(useCallback(() => apiGet(apiBase, '/api/trades/open'), [apiBase]), 5000);
-  const history = usePolling(useCallback(() => apiGet(apiBase, '/api/trades/history?limit=100'), [apiBase]), 10000);
-  const signalsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/signals/recent?limit=50'), [apiBase]), 8000);
+  const status = usePolling(useCallback(() => apiGet(apiBase, '/api/status'), [apiBase]), 3000);
+  const openTrades = usePolling(useCallback(() => apiGet(apiBase, '/api/trades/open'), [apiBase]), 3000);
+  const history = usePolling(useCallback(() => apiGet(apiBase, '/api/trades/history?limit=100'), [apiBase]), 5000);
+  const signalsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/signals/recent?limit=50'), [apiBase]), 5000);
   const logsQ = usePolling(useCallback(() => apiGet(apiBase,
-    `/api/logs?limit=200${logFilter !== 'all' ? '&level=' + logFilter : ''}`), [apiBase, logFilter]), 5000);
-  const statsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/stats'), [apiBase]), 10000);
+    `/api/logs?limit=200${logFilter !== 'all' ? '&level=' + logFilter : ''}`), [apiBase, logFilter]), 4000);
+  const statsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/stats'), [apiBase]), 4000);
   const credsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/credentials/status'), [apiBase]), 10000);
-  const balanceQ = usePolling(useCallback(() => apiGet(apiBase, '/api/account/balance'), [apiBase]), 10000);
-  const quantMetricsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/quant/metrics'), [apiBase]), 4000);
+  const balanceQ = usePolling(useCallback(() => apiGet(apiBase, '/api/account/balance'), [apiBase]), 4000);
+  const quantMetricsQ = usePolling(useCallback(() => apiGet(apiBase, '/api/quant/metrics'), [apiBase]), 3000);
 
   const handleSync = async () => {
     setSyncing(true);
@@ -1120,7 +1137,7 @@ export default function KehloDashboard() {
       {/* hero stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-px" style={{ background: C.hairline }}>
         {[
-          { label: 'Active Positions', value: status.data?.open_position_count ?? '···', color: C.paper },
+          { label: 'Active Positions', value: openTrades.data != null ? openTrades.data.length : (status.data?.open_position_count ?? '···'), color: C.paper },
           {
             label: 'Closed Realized P&L', color: (statsQ.data?.total_pnl ?? 0) >= 0 ? C.long : C.short,
             value: statsQ.data ? `${statsQ.data.total_pnl >= 0 ? '+' : ''}$${statsQ.data.total_pnl.toFixed(2)}` : '···',
