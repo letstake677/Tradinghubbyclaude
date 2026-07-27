@@ -951,15 +951,26 @@ async function scanCoinsAndGenerateSignals() {
     const variance = ((symHash % 15) - 7) / 100;
 
     let rawConfidence = 0.15 + sweepScore + momentumScore + volumeScore + biasScore + displacementScore + variance;
-    const confidence = Math.min(0.96, Math.max(0.52, Math.round(rawConfidence * 100) / 100));
+    let confidence = Math.min(0.96, Math.max(0.52, Math.round(rawConfidence * 100) / 100));
 
     // Filter validation logic
     const currentUtcHour = new Date().getUTCHours();
     const sessionConfirmed = !settings.session_filter_enabled || (currentUtcHour >= 0 && currentUtcHour <= 21);
-    const htfBiasConfirmed = !settings.htf_bias_enabled || (isBullish ? chg24 >= -2.5 : chg24 <= 2.5);
-    const sweepConfirmed = !settings.require_sweep_confirmation || (posInRange < 0.38 || posInRange > 0.62);
-    const displacementConfirmed = !settings.displacement_filter_enabled || (Math.abs(chg24) >= 0.5 || volM > 15);
-    const minThreshold = 0.72;
+    const htfBiasConfirmed = !settings.htf_bias_enabled || (isBullish ? chg24 >= -3.5 : chg24 <= 3.5);
+    const sweepConfirmed = !settings.require_sweep_confirmation || (posInRange < 0.42 || posInRange > 0.58);
+    const displacementConfirmed = !settings.displacement_filter_enabled || (Math.abs(chg24) >= 0.3 || volM > 5);
+    const minThreshold = 0.70;
+
+    // Penalize confidence if required filters fail so filtered signals don't show falsely high confidence
+    let filterPenalty = 0;
+    if (!sessionConfirmed) filterPenalty += 0.25;
+    if (!htfBiasConfirmed) filterPenalty += 0.25;
+    if (!sweepConfirmed) filterPenalty += 0.25;
+    if (!displacementConfirmed) filterPenalty += 0.25;
+
+    if (filterPenalty > 0) {
+      confidence = Math.max(0.48, Math.min(0.68, Math.round((confidence - filterPenalty) * 100) / 100));
+    }
 
     const passesFilters = confidence >= minThreshold && sessionConfirmed && htfBiasConfirmed && sweepConfirmed && displacementConfirmed;
 
