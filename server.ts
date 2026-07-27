@@ -8,6 +8,7 @@ import {
   fetchLiveBalance,
   fetchLiveOpenPositions,
   fetchLiveOrderHistory,
+  closeLivePosition,
 } from './bitgetService';
 
 const app = express();
@@ -449,8 +450,32 @@ app.get('/api/trades/open', async (req: Request, res: Response) => {
   res.json(getActiveOpenTrades());
 });
 
-app.post('/api/trades/:id/close', (req: Request, res: Response) => {
-  const tradeId = Number(req.params.id);
+app.post('/api/trades/:id/close', async (req: Request, res: Response) => {
+  const tradeIdParam = req.params.id;
+
+  if (liveModeActive) {
+    if (!liveCredentials || !liveCredentials.apiKey) {
+      return res.status(400).json({ error: 'Bitget Live API credentials are not configured.' });
+    }
+
+    const livePos = await fetchLiveOpenPositions(liveCredentials);
+    const target = (livePos.positions || []).find(
+      (p: any) => String(p.id) === String(tradeIdParam) || p.symbol === tradeIdParam
+    );
+
+    const symbolToClose = target ? target.symbol : tradeIdParam;
+    const result = await closeLivePosition(liveCredentials, symbolToClose);
+
+    if (result.error) {
+      addLog('error', 'bitget_live', `Failed to close Bitget position ${symbolToClose}: ${result.error}`);
+      return res.status(400).json({ error: result.error });
+    }
+
+    addLog('info', 'bitget_live', `[BITGET LIVE] Manual close request executed for ${symbolToClose} via Bitget API`);
+    return res.json({ closed: true, symbol: symbolToClose, mode: 'live' });
+  }
+
+  const tradeId = Number(tradeIdParam);
   const trades = getActiveOpenTrades();
   const history = getActiveTradeHistory();
   const index = trades.findIndex((t) => t.id === tradeId);
@@ -469,14 +494,13 @@ app.post('/api/trades/:id/close', (req: Request, res: Response) => {
     entry_price: trade.entry_price,
     close_price: closePrice,
     realized_pnl: pnl,
-    close_reason: liveModeActive ? 'Bitget Live Real Execution Exit' : 'Manual exit via dashboard',
+    close_reason: 'Manual exit via dashboard',
     closed_at: Math.floor(Date.now() / 1000),
-    dry_run: !liveModeActive,
+    dry_run: true,
   });
 
-  const modeTag = liveModeActive ? '[BITGET LIVE]' : '[DEMO]';
-  addLog('info', 'api', `${modeTag} [${trade.symbol}] Position #${tradeId} closed @ $${closePrice.toFixed(2)}, PnL +$${pnl}`);
-  res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice, mode: liveModeActive ? 'live' : 'dry_run' });
+  addLog('info', 'api', `[DEMO] [${trade.symbol}] Position #${tradeId} closed @ $${closePrice.toFixed(2)}, PnL +$${pnl}`);
+  res.json({ closed: true, trade_id: tradeId, pnl, close_price: closePrice, mode: 'dry_run' });
 });
 
 app.get('/api/trades/history', async (req: Request, res: Response) => {

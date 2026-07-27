@@ -235,3 +235,27 @@ export async function fetchLiveOrderHistory(creds: BitgetCredentials) {
     };
   }
 }
+
+export async function closeLivePosition(creds: BitgetCredentials, symbol: string) {
+  try {
+    const res = await bitgetApiRequest(
+      '/api/v2/mix/order/close-positions',
+      'POST',
+      {
+        productType: 'USDT-FUTURES',
+        symbol: symbol,
+      },
+      creds
+    );
+
+    if (res.code !== '00000') {
+      return {
+        error: `Bitget API Error (${res.code}): ${res.msg || 'Failed to close position on Bitget'}`,
+      };
+    }
+
+    return { success: true, data: res.data };
+  } catch (err: any) {
+    return { error: `Network/Bitget API Error: ${err.message || String(err)}` };
+  }
+}
