@@ -636,12 +636,11 @@ export async function placeLiveOrder(
     let tpError = null;
     let slError = null;
 
-    // NOTE: presetStopLossPrice was ALREADY attached to the order in Bitget place-order call above.
-    // We only create a plan order IF presetStopLossPrice was not sent in place-order!
+    // Attach Stop Loss plan order if not attached in place-order call
     if (!payload.presetStopLossPrice && params.presetStopLossPrice) {
       const numSL = typeof params.presetStopLossPrice === 'number' ? params.presetStopLossPrice : parseFloat(String(params.presetStopLossPrice));
       if (!isNaN(numSL) && numSL > 0) {
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 600));
         const slRes = await placeLiveTPSL(creds, {
           symbol: params.symbol,
           holdSide: params.direction,
@@ -653,24 +652,38 @@ export async function placeLiveOrder(
       }
     }
 
-    // Attach explicit Partial TP plan orders with Minimum Contract Size validation
+    // Attach Partial TP plan orders with position lookup and min size validation
     if (params.tp_legs && params.tp_legs.length > 0) {
-      await new Promise(r => setTimeout(r, 1000));
-      
-      const numTotalSize = parseFloat(sizeToUse);
+      // Wait for Bitget to record filled market order
+      await new Promise(r => setTimeout(r, 1200));
+
+      // Fetch actual filled position size from Bitget
+      let actualSizeStr = sizeToUse;
+      try {
+        const livePositionsRes = await fetchLiveOpenPositions(creds);
+        if (livePositionsRes.positions && livePositionsRes.positions.length > 0) {
+          const matched = livePositionsRes.positions.find((p) => p.symbol === params.symbol);
+          if (matched && matched.position_size > 0) {
+            actualSizeStr = String(matched.position_size);
+          }
+        }
+      } catch (e) {
+        // Fallback to sizeToUse
+      }
+
+      const numTotalSize = parseFloat(actualSizeStr);
       const minSizeStr = getStandardContractSize(params.symbol, params.price);
       const minSizeNum = parseFloat(minSizeStr);
-      const dotIndex = sizeToUse.indexOf('.');
-      const precision = dotIndex === -1 ? 0 : sizeToUse.length - dotIndex - 1;
+      const dotIndex = actualSizeStr.indexOf('.');
+      const precision = dotIndex === -1 ? 0 : actualSizeStr.length - dotIndex - 1;
 
-      // Consolidate TP legs so that every leg satisfies Bitget minimum contract size
       let validLegs: Array<{ price: number; sizeStr: string }> = [];
 
       if (numTotalSize < 2 * minSizeNum) {
-        // Can only place 1 TP leg for 100% of order size
-        validLegs = [{ price: params.tp_legs[0].price, sizeStr: sizeToUse }];
+        // Standard single TP for 100% position size
+        validLegs = [{ price: params.tp_legs[0].price, sizeStr: actualSizeStr }];
       } else if (numTotalSize < 3 * minSizeNum || params.tp_legs.length === 2) {
-        // Split into 2 legs
+        // Split into 2 TP legs
         const leg1Size = Math.max(minSizeNum, Math.floor((numTotalSize * 0.5) / minSizeNum) * minSizeNum);
         const leg2Size = Math.round((numTotalSize - leg1Size) * 1000000) / 1000000;
         validLegs = [
@@ -678,7 +691,7 @@ export async function placeLiveOrder(
           { price: params.tp_legs[1]?.price || params.tp_legs[0].price, sizeStr: leg2Size.toFixed(precision) }
         ];
       } else {
-        // 3 legs
+        // Split into 3 TP legs (40%, 30%, 30%)
         const leg1Size = Math.max(minSizeNum, Math.floor((numTotalSize * 0.4) / minSizeNum) * minSizeNum);
         const leg2Size = Math.max(minSizeNum, Math.floor((numTotalSize * 0.3) / minSizeNum) * minSizeNum);
         const leg3Size = Math.round((numTotalSize - leg1Size - leg2Size) * 1000000) / 1000000;
@@ -702,7 +715,7 @@ export async function placeLiveOrder(
           });
           
           if (tpRes.error) {
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, 800));
             tpRes = await placeLiveTPSL(creds, {
               symbol: params.symbol,
               holdSide: params.direction,
@@ -721,9 +734,12 @@ export async function placeLiveOrder(
       }
 
       if (tpResults.some(r => r.success)) {
-        tpError = tpResults.filter(r => !r.success).map(r => `${r.price}: ${r.error}`).join('; ') || null;
+        const failedLogs = tpResults.filter(r => !r.success);
+        if (failedLogs.length > 0) {
+          tpError = failedLogs.map(r => `$${r.price}: ${r.error}`).join('; ');
+        }
       } else if (tpResults.length > 0) {
-        tpError = tpResults.map(r => `${r.price}: ${r.error}`).join('; ');
+        tpError = tpResults.map(r => `$${r.price}: ${r.error}`).join('; ');
       }
     }
 
@@ -766,11 +782,12 @@ export async function placeLiveTPSL(
         }
       }
       if (!sizeToUse) {
-        sizeToUse = '0.1'; // safe fallback
+        sizeToUse = '0.1';
       }
     }
 
-    const payload: Record<string, any> = {
+    // Method 1: Place via /api/v2/mix/order/place-tpsl-order with orderType = 'market'
+    const payloadTPSL: Record<string, any> = {
       productType: 'USDT-FUTURES',
       symbol: params.symbol,
       marginCoin: 'USDT',
@@ -779,16 +796,44 @@ export async function placeLiveTPSL(
       triggerType: 'mark_price',
       holdSide: params.holdSide,
       size: sizeToUse,
+      orderType: 'market',
     };
 
-    let res = await bitgetApiRequest('/api/v2/mix/order/place-tpsl-order', 'POST', payload, creds);
+    let res = await bitgetApiRequest('/api/v2/mix/order/place-tpsl-order', 'POST', payloadTPSL, creds);
+
+    // Retry Method 1 without holdSide if side mismatch error
     if (res.code !== '00000' && (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side') || res.msg.toLowerCase().includes('unilateral'))))) {
-      delete payload.holdSide;
-      res = await bitgetApiRequest('/api/v2/mix/order/place-tpsl-order', 'POST', payload, creds);
+      delete payloadTPSL.holdSide;
+      res = await bitgetApiRequest('/api/v2/mix/order/place-tpsl-order', 'POST', payloadTPSL, creds);
+    }
+
+    // Method 2 Fallback: Place via /api/v2/mix/order/place-plan-order if place-tpsl-order failed
+    if (res.code !== '00000') {
+      const isLong = params.holdSide.toLowerCase() === 'long';
+      const payloadPlan: Record<string, any> = {
+        productType: 'USDT-FUTURES',
+        symbol: params.symbol,
+        marginCoin: 'USDT',
+        planType: params.planType,
+        triggerPrice: formattedPrice,
+        triggerType: 'mark_price',
+        executePrice: '0',
+        holdSide: params.holdSide,
+        side: isLong ? 'sell' : 'buy',
+        size: sizeToUse,
+        orderType: 'market',
+      };
+
+      res = await bitgetApiRequest('/api/v2/mix/order/place-plan-order', 'POST', payloadPlan, creds);
+      
+      if (res.code !== '00000' && (res.code === '400172' || res.code === '40774' || (res.msg && (res.msg.includes('side') || res.msg.toLowerCase().includes('unilateral'))))) {
+        delete payloadPlan.holdSide;
+        res = await bitgetApiRequest('/api/v2/mix/order/place-plan-order', 'POST', payloadPlan, creds);
+      }
     }
 
     if (res.code !== '00000') {
-      const errMsg = `[BITGET TPSL ERROR] ${params.symbol} ${params.planType} at ${formattedPrice}: ${res.msg}`;
+      const errMsg = `[BITGET TPSL ERROR] ${params.symbol} ${params.planType} at $${formattedPrice} (Size: ${sizeToUse}): ${res.msg || 'Unknown error'}`;
       console.error(errMsg);
       return { error: errMsg, code: res.code, msg: res.msg };
     }
